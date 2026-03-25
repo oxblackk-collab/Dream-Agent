@@ -7,9 +7,10 @@ Verified connections get an energy boost. Rejected connections decay.
 Results are stored in the dream log with wake_verified flag.
 
 Evaluation chain (first available wins):
-  1. Claude Code CLI (`claude --print`) — no API key needed
-  2. Anthropic SDK (requires ANTHROPIC_API_KEY)
-  3. No evaluation — returns connections with wake_verified=None
+  1. OAuth via macOS keychain (Claude Max credentials)
+  2. Claude Code CLI (`claude --print`) — no API key needed
+  3. Anthropic SDK (requires ANTHROPIC_API_KEY)
+  4. No evaluation — returns connections with wake_verified=None
 """
 
 from __future__ import annotations
@@ -18,10 +19,14 @@ import asyncio
 import json
 import logging
 import os
+import platform
 import re
 import shutil
 import subprocess
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -147,8 +152,19 @@ def _parse_claude_response(text: str, expected_count: int) -> list[WakeResult]:
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
-        logger.warning("Failed to parse Claude response as JSON: %s", text[:300])
-        return []
+        # Try to recover truncated JSON — find all complete objects
+        recovered = []
+        for m in re.finditer(r'\{[^{}]*\}', text):
+            try:
+                recovered.append(json.loads(m.group(0)))
+            except json.JSONDecodeError:
+                continue
+        if recovered:
+            logger.info("Recovered %d items from truncated JSON response", len(recovered))
+            data = recovered
+        else:
+            logger.warning("Failed to parse Claude response as JSON: %s", text[:300])
+            return []
 
     if not isinstance(data, list):
         logger.warning("Claude response is not a list: %s", type(data))
@@ -168,7 +184,133 @@ def _parse_claude_response(text: str, expected_count: int) -> list[WakeResult]:
     return results
 
 
+# ── OAuth helpers ──────────────────────────────────────
+
+_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+_OAUTH_TOKEN_URL = "https://console.anthropic.com/v1/oauth/token"
+_OAUTH_API_URL = "https://api.anthropic.com/v1/messages?beta=true"
+_OAUTH_BETA = "claude-code-20250219,interleaved-thinking-2025-05-14,oauth-2025-04-20"
+_OAUTH_USER_AGENT = "claude-cli/2.1.83 (external, cli)"
+_REFRESH_BUFFER_MS = 5 * 60 * 1000
+
+
+def _read_keychain_credentials() -> dict | None:
+    if platform.system() != "Darwin":
+        return None
+    try:
+        result = subprocess.run(
+            ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    try:
+        creds = json.loads(result.stdout.strip())
+        oauth = creds.get("claudeAiOauth", {})
+        access_token = oauth.get("accessToken")
+        refresh_token = oauth.get("refreshToken")
+        expires_at = oauth.get("expiresAt", 0)
+        if not access_token or not refresh_token:
+            return None
+        return {"accessToken": access_token, "refreshToken": refresh_token, "expiresAt": expires_at}
+    except (json.JSONDecodeError, KeyError):
+        return None
+
+
+def _refresh_oauth_token(refresh_token: str) -> dict | None:
+    body = urllib.parse.urlencode({
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": _OAUTH_CLIENT_ID,
+    }).encode()
+    req = urllib.request.Request(
+        _OAUTH_TOKEN_URL, data=body, method="POST",
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": _OAUTH_USER_AGENT,
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read())
+        return {
+            "accessToken": data["access_token"],
+            "refreshToken": data.get("refresh_token", refresh_token),
+            "expiresAt": int(time.time()) + data.get("expires_in", 3600),
+        }
+    except Exception as exc:
+        logger.warning("OAuth token refresh failed: %s", exc)
+        return None
+
+
+def _get_oauth_access_token() -> str | None:
+    creds = _read_keychain_credentials()
+    if creds is None:
+        return None
+    now_ms = int(time.time() * 1000)
+    expires_ms = creds["expiresAt"]
+    if expires_ms < now_ms + _REFRESH_BUFFER_MS:
+        logger.info("OAuth token expired or expiring soon, refreshing")
+        refreshed = _refresh_oauth_token(creds["refreshToken"])
+        if refreshed is None:
+            return None
+        return refreshed["accessToken"]
+    return creds["accessToken"]
+
+
+def _call_anthropic_oauth(access_token: str, prompt: str, model: str = "claude-haiku-4-5-20251001") -> str | None:
+    payload = json.dumps({
+        "model": model,
+        "max_tokens": 4096,
+        "messages": [{"role": "user", "content": prompt}],
+    }).encode()
+    req = urllib.request.Request(
+        _OAUTH_API_URL, data=payload, method="POST",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "anthropic-beta": _OAUTH_BETA,
+            "user-agent": _OAUTH_USER_AGENT,
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            data = json.loads(resp.read())
+        content = data.get("content", [])
+        if content and content[0].get("type") == "text":
+            return content[0]["text"]
+        return None
+    except Exception as exc:
+        logger.error("OAuth API call failed: %s", exc)
+        return None
+
+
 # ── Evaluation backends ────────────────────────────────
+
+
+def _evaluate_via_oauth(
+    prompt: str,
+    connections_count: int,
+    model: str = "claude-haiku-4-5-20251001",
+) -> list[WakeResult] | None:
+    if platform.system() != "Darwin":
+        return None
+    access_token = _get_oauth_access_token()
+    if access_token is None:
+        logger.info("OAuth credentials not available, skipping OAuth backend")
+        return None
+    logger.info("Wake filter: using OAuth (keychain)")
+    text = _call_anthropic_oauth(access_token, prompt, model)
+    if text is None:
+        return None
+    results = _parse_claude_response(text, connections_count)
+    if not results:
+        logger.warning("Could not parse OAuth response")
+        return None
+    return results
 
 
 def _evaluate_via_cli(
@@ -250,6 +392,82 @@ def _evaluate_via_api(
 
 
 # ── Async evaluation backends ─────────────────────────
+
+
+async def _read_keychain_credentials_async() -> dict | None:
+    if platform.system() != "Darwin":
+        return None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "security", "find-generic-password", "-s", "Claude Code-credentials", "-w",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+    except (FileNotFoundError, asyncio.TimeoutError):
+        return None
+    if proc.returncode != 0 or not stdout:
+        return None
+    try:
+        creds = json.loads(stdout.decode().strip())
+        oauth = creds.get("claudeAiOauth", {})
+        access_token = oauth.get("accessToken")
+        refresh_token = oauth.get("refreshToken")
+        expires_at = oauth.get("expiresAt", 0)
+        if not access_token or not refresh_token:
+            return None
+        return {"accessToken": access_token, "refreshToken": refresh_token, "expiresAt": expires_at}
+    except (json.JSONDecodeError, KeyError):
+        return None
+
+
+async def _refresh_oauth_token_async(refresh_token: str) -> dict | None:
+    loop = asyncio.get_running_loop()
+    try:
+        return await loop.run_in_executor(None, _refresh_oauth_token, refresh_token)
+    except Exception as exc:
+        logger.warning("Async OAuth token refresh failed: %s", exc)
+        return None
+
+
+async def _call_anthropic_oauth_async(access_token: str, prompt: str, model: str = "claude-haiku-4-5-20251001") -> str | None:
+    loop = asyncio.get_running_loop()
+    try:
+        return await loop.run_in_executor(None, _call_anthropic_oauth, access_token, prompt, model)
+    except Exception as exc:
+        logger.error("Async OAuth API call failed: %s", exc)
+        return None
+
+
+async def _evaluate_via_oauth_async(
+    prompt: str,
+    connections_count: int,
+    model: str = "claude-haiku-4-5-20251001",
+) -> list[WakeResult] | None:
+    if platform.system() != "Darwin":
+        return None
+    creds = await _read_keychain_credentials_async()
+    if creds is None:
+        logger.info("OAuth credentials not available (async), skipping OAuth backend")
+        return None
+    now_ms = int(time.time() * 1000)
+    expires_ms = creds["expiresAt"]
+    access_token = creds["accessToken"]
+    if expires_ms < now_ms + _REFRESH_BUFFER_MS:
+        logger.info("OAuth token expired or expiring soon, refreshing (async)")
+        refreshed = await _refresh_oauth_token_async(creds["refreshToken"])
+        if refreshed is None:
+            return None
+        access_token = refreshed["accessToken"]
+    logger.info("Wake filter (async): using OAuth (keychain)")
+    text = await _call_anthropic_oauth_async(access_token, prompt, model)
+    if text is None:
+        return None
+    results = _parse_claude_response(text, connections_count)
+    if not results:
+        logger.warning("Could not parse OAuth response (async)")
+        return None
+    return results
 
 
 async def _evaluate_via_cli_async(
@@ -339,9 +557,10 @@ class WakeFilter:
     """Evaluates substrate connections via Claude contrast.
 
     Tries backends in order:
-      1. Claude Code CLI (`claude --print`)
-      2. Anthropic SDK (requires ANTHROPIC_API_KEY)
-      3. Returns empty (no evaluation available)
+      1. OAuth via macOS keychain (Claude Max credentials)
+      2. Claude Code CLI (`claude --print`)
+      3. Anthropic SDK (requires ANTHROPIC_API_KEY)
+      4. Returns empty (no evaluation available)
 
     Usage:
         wake = WakeFilter()
@@ -351,8 +570,10 @@ class WakeFilter:
     def __init__(
         self,
         model: str = "claude-sonnet-4-20250514",
+        oauth_model: str = "claude-haiku-4-5-20251001",
     ) -> None:
         self.model = model
+        self.oauth_model = oauth_model
 
     def evaluate(
         self,
@@ -369,21 +590,28 @@ class WakeFilter:
 
         prompt = _build_prompt(query, connections, session_context)
 
-        # Backend 1: Claude Code CLI
+        # Backend 1: OAuth (macOS keychain)
+        results = _evaluate_via_oauth(prompt, len(connections), self.oauth_model)
+        if results is not None:
+            verified = sum(1 for r in results if r.verified)
+            logger.info("Wake filter (OAuth): %d/%d verified", verified, len(results))
+            return results, "oauth"
+
+        # Backend 2: Claude Code CLI
         results = _evaluate_via_cli(prompt, len(connections))
         if results is not None:
             verified = sum(1 for r in results if r.verified)
             logger.info("Wake filter (CLI): %d/%d verified", verified, len(results))
             return results, "cli"
 
-        # Backend 2: Anthropic SDK
+        # Backend 3: Anthropic SDK
         results = _evaluate_via_api(prompt, len(connections), self.model)
         if results is not None:
             verified = sum(1 for r in results if r.verified)
             logger.info("Wake filter (API): %d/%d verified", verified, len(results))
             return results, "api"
 
-        # Backend 3: No evaluation available
+        # Backend 4: No evaluation available
         logger.warning("Wake filter: no backend available, returning unverified")
         return [], "none"
 
@@ -403,21 +631,28 @@ class WakeFilter:
 
         prompt = _build_prompt(query, connections, session_context)
 
-        # Backend 1: Claude Code CLI (async)
+        # Backend 1: OAuth (macOS keychain, async)
+        results = await _evaluate_via_oauth_async(prompt, len(connections), self.oauth_model)
+        if results is not None:
+            verified = sum(1 for r in results if r.verified)
+            logger.info("Wake filter (OAuth async): %d/%d verified", verified, len(results))
+            return results, "oauth"
+
+        # Backend 2: Claude Code CLI (async)
         results = await _evaluate_via_cli_async(prompt, len(connections))
         if results is not None:
             verified = sum(1 for r in results if r.verified)
             logger.info("Wake filter (CLI async): %d/%d verified", verified, len(results))
             return results, "cli"
 
-        # Backend 2: Anthropic SDK (async)
+        # Backend 3: Anthropic SDK (async)
         results = await _evaluate_via_api_async(prompt, len(connections), self.model)
         if results is not None:
             verified = sum(1 for r in results if r.verified)
             logger.info("Wake filter (API async): %d/%d verified", verified, len(results))
             return results, "api"
 
-        # Backend 3: No evaluation available
+        # Backend 4: No evaluation available
         logger.warning("Wake filter: no backend available, returning unverified")
         return [], "none"
 
