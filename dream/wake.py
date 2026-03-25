@@ -21,6 +21,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -29,49 +30,59 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-CONTRAST_PROMPT_WITH_CONTEXT = """Current work context: {session_context}
+CONTRAST_PROMPT_WITH_CONTEXT = """Contexto de trabajo actual: {session_context}
 Query: {query}
 
-Evaluate these lateral connections discovered by a cognitive substrate.
-For each connection between two domains, determine:
+Evaluá estas conexiones laterales descubiertas por un sustrato cognitivo.
+Para cada conexión entre dos dominios, determiná:
 
-1. Is it a GENUINE insight — a structural parallel, a shared principle,
-   or a transferable pattern between the domains?
-2. Or is it a COINCIDENTAL overlap — similar words/concepts that
-   don't illuminate each other?
-3. Is it RELEVANT to the problem being solved now?
+1. ¿Es un insight GENUINO — un paralelo estructural, un principio compartido,
+   o un patrón transferible entre los dominios?
+2. ¿O es un solapamiento COINCIDENTAL — palabras/conceptos similares que
+   no se iluminan mutuamente?
+3. ¿Es RELEVANTE para el problema que se está resolviendo ahora?
+4. ¿Es ACCIONABLE — podría este insight cambiar concretamente cómo
+   se construye, se resuelve un problema, o se toma una decisión?
+   Paralelos filosóficos abstractos sin aplicación práctica NO califican.
 
-Be STRICT. Only verify connections that would genuinely change how
-someone thinks about one domain by understanding the other.
+Sé MUY ESTRICTO. Solo verificá conexiones que:
+- Genuinamente cambiarían cómo alguien piensa sobre un dominio
+- Y que sugieran una acción concreta, un cambio de diseño, o una nueva estrategia
+Paralelos puramente filosóficos o estructurales sin aplicación práctica → verified: false
 
-Connections to evaluate:
+Conexiones a evaluar:
 {connections_text}
 
-Respond in strict JSON (no markdown, no backticks):
+Respondé en JSON estricto (sin markdown, sin backticks):
 [
-  {{"index": 0, "verified": true/false, "confidence": 0.0-1.0, "reasoning": "one sentence"}},
+  {{"index": 0, "verified": true/false, "confidence": 0.0-1.0, "reasoning": "una oración"}},
   ...
 ]"""
 
 CONTRAST_PROMPT_NO_CONTEXT = """Query: {query}
 
-Evaluate these lateral connections discovered by a cognitive substrate.
-For each connection between two domains, determine:
+Evaluá estas conexiones laterales descubiertas por un sustrato cognitivo.
+Para cada conexión entre dos dominios, determiná:
 
-1. Is it a GENUINE insight — a structural parallel, a shared principle,
-   or a transferable pattern between the domains?
-2. Or is it a COINCIDENTAL overlap — similar words/concepts that
-   don't illuminate each other?
+1. ¿Es un insight GENUINO — un paralelo estructural, un principio compartido,
+   o un patrón transferible entre los dominios?
+2. ¿O es un solapamiento COINCIDENTAL — palabras/conceptos similares que
+   no se iluminan mutuamente?
+3. ¿Es ACCIONABLE — podría este insight cambiar concretamente cómo
+   se construye, se resuelve un problema, o se toma una decisión?
+   Paralelos filosóficos abstractos sin aplicación práctica NO califican.
 
-Be STRICT. Only verify connections that would genuinely change how
-someone thinks about one domain by understanding the other.
+Sé MUY ESTRICTO. Solo verificá conexiones que:
+- Genuinamente cambiarían cómo alguien piensa sobre un dominio
+- Y que sugieran una acción concreta, un cambio de diseño, o una nueva estrategia
+Paralelos puramente filosóficos o estructurales sin aplicación práctica → verified: false
 
-Connections to evaluate:
+Conexiones a evaluar:
 {connections_text}
 
-Respond in strict JSON (no markdown, no backticks):
+Respondé en JSON estricto (sin markdown, sin backticks):
 [
-  {{"index": 0, "verified": true/false, "confidence": 0.0-1.0, "reasoning": "one sentence"}},
+  {{"index": 0, "verified": true/false, "confidence": 0.0-1.0, "reasoning": "una oración"}},
   ...
 ]"""
 
@@ -90,7 +101,7 @@ def _format_connections_for_prompt(connections: list[LateralConnection]) -> str:
     lines = []
     for i, conn in enumerate(connections):
         lines.append(
-            f"{i}. [{conn.cell_domain}] <-> [{conn.connected_to_domain}] "
+            f"{i}. [{conn.cell_domain}] ↔ [{conn.connected_to_domain}] "
             f"(sig={conn.intersection_significance}, overlap={conn.intersection_overlap})\n"
             f"   A: {conn.cell_text[:200]}\n"
             f"   B: {conn.connected_to_text[:200]}"
@@ -157,7 +168,7 @@ def _parse_claude_response(text: str, expected_count: int) -> list[WakeResult]:
     return results
 
 
-# -- Evaluation backends --------------------------------------------
+# ── Evaluation backends ────────────────────────────────
 
 
 def _evaluate_via_cli(
@@ -238,7 +249,7 @@ def _evaluate_via_api(
     return _parse_claude_response(text, connections_count)
 
 
-# -- Async evaluation backends ---------------------------------------
+# ── Async evaluation backends ─────────────────────────
 
 
 async def _evaluate_via_cli_async(
@@ -321,7 +332,7 @@ async def _evaluate_via_api_async(
     return _parse_claude_response(text, connections_count)
 
 
-# -- Main interface -------------------------------------------------
+# ── Main interface ─────────────────────────────────────
 
 
 class WakeFilter:
@@ -411,7 +422,7 @@ class WakeFilter:
         return [], "none"
 
 
-# -- Auto-wake (called by Dreamer callback) -------------------------
+# ── Auto-wake (called by Dreamer callback) ─────────────
 
 
 def auto_wake(
@@ -434,9 +445,27 @@ def auto_wake(
     if not significant:
         return 0
 
+    # Get already-verified domain pairs to skip duplicates
+    verified_pairs: set[frozenset[str]] = set()
+    try:
+        with store._conn() as conn:
+            rows = conn.execute(
+                """SELECT DISTINCT c1.domain, c2.domain
+                   FROM dream_log dl
+                   JOIN intersections ix ON dl.intersection_id = ix.id
+                   JOIN cells c1 ON ix.parent_a = c1.id
+                   JOIN cells c2 ON ix.parent_b = c2.id
+                   WHERE dl.wake_verified = 1
+                   AND c1.domain != '' AND c2.domain != ''""",
+            ).fetchall()
+            for r in rows:
+                verified_pairs.add(frozenset({r[0], r[1]}))
+    except Exception as exc:
+        logger.warning("Failed to load verified domain pairs: %s", exc)
+
     # Build LateralConnection objects from parent cells
     connections = []
-    ix_map = {}  # index -> intersection for later dream_log update
+    ix_map = {}  # index → intersection for later dream_log update
     for ix in significant[:10]:  # Cap at 10 per batch
         cell_a = substrate.get_cell(ix.parent_a_id)
         cell_b = substrate.get_cell(ix.parent_b_id)
@@ -445,6 +474,11 @@ def auto_wake(
         # Skip intra-domain (same domain, less interesting)
         if cell_a.domain and cell_b.domain and cell_a.domain == cell_b.domain:
             continue
+        # Skip domain pairs that already have a verified insight
+        if cell_a.domain and cell_b.domain:
+            pair = frozenset({cell_a.domain, cell_b.domain})
+            if pair in verified_pairs:
+                continue
         idx = len(connections)
         ix_map[idx] = (ix, cell_a, cell_b)
         connections.append(LateralConnection(
@@ -512,11 +546,17 @@ def auto_wake(
 
         # Find dream_log entry for this intersection and record verification
         try:
-            row = store.find_dream_log_by_intersection(str(ix.id))
-            if row:
-                store.set_wake_verification(
-                    row["id"], wr.verified, wr.reasoning,
-                )
+            # Search recent entries for matching intersection_id
+            with store._conn() as conn:
+                row = conn.execute(
+                    "SELECT id FROM dream_log WHERE intersection_id = ? "
+                    "ORDER BY id DESC LIMIT 1",
+                    (str(ix.id),),
+                ).fetchone()
+                if row:
+                    store.set_wake_verification(
+                        row["id"], wr.verified, wr.reasoning,
+                    )
         except Exception as exc:
             logger.warning("Failed to record wake verification: %s", exc)
 
@@ -526,4 +566,3 @@ def auto_wake(
     )
 
     return verified_count
-

@@ -228,6 +228,20 @@ class Primitives:
             if parent_a is None or parent_b is None:
                 continue
 
+            domain_a = parent_a.domain
+            domain_b = parent_b.domain
+            if domain_a and domain_b:
+                if domain_a == domain_b:
+                    inherited_domain = domain_a
+                else:
+                    inherited_domain = "+".join(sorted([domain_a, domain_b]))
+            elif domain_a:
+                inherited_domain = domain_a
+            elif domain_b:
+                inherited_domain = domain_b
+            else:
+                inherited_domain = "emergent"
+
             avg_confidence = (
                 parent_a.confidence + parent_b.confidence
             ) / 2.0
@@ -260,6 +274,7 @@ class Primitives:
                 confidence=avg_confidence,
                 parent_ids=[ix.parent_a_id, ix.parent_b_id],
                 generation=generation,
+                domain=inherited_domain,
             )
             new_cell.parent_hash = parent_hash
             # Promoted cells carry a blend of their parents' text
@@ -294,4 +309,3 @@ class Primitives:
                 promoted_cells.extend(further_promoted)
 
         return promoted_cells
-

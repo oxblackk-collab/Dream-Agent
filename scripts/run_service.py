@@ -1,12 +1,12 @@
-"""Dream Agent Service — standalone substrate server.
+"""Mycelium Service — standalone substrate server.
 
-Starts a FastAPI server with the REST API, Dream agent endpoints,
-and automatic background consolidation (Dreamer daemon).
+Starts a FastAPI server with the REST API and optionally the
+3D Microscope visualization.
 
 Usage:
-    python scripts/run_service.py
-    python scripts/run_service.py --db data/substrate.db
-    python scripts/run_service.py --port 8080
+    uv run python scripts/run_service.py
+    uv run python scripts/run_service.py --db data/substrate.db
+    uv run python scripts/run_service.py --port 8080 --no-viz
 """
 
 from __future__ import annotations
@@ -20,14 +20,14 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s -- %(message)s",
+    format="%(asctime)s %(levelname)s — %(message)s",
 )
 logger = logging.getLogger(__name__)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Dream Agent Service"
+        description="Mycelium Substrate Service"
     )
     parser.add_argument(
         "--db",
@@ -39,6 +39,11 @@ def main() -> None:
         "--host", type=str, default="127.0.0.1"
     )
     parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument(
+        "--no-viz",
+        action="store_true",
+        help="Disable 3D Microscope, API only",
+    )
     args = parser.parse_args()
 
     import uvicorn
@@ -82,8 +87,8 @@ def main() -> None:
             )
 
     app = FastAPI(
-        title="Dream Agent",
-        description="Cognitive Memory Agent — Mycelium Substrate Service",
+        title="Mycelium",
+        description="Cognitive Substrate Service",
         version="0.1.0",
     )
     app.include_router(
@@ -92,7 +97,7 @@ def main() -> None:
 
     # Mount Dream agent endpoints if store is available
     if store is not None:
-        from dream.router import create_dream_router
+        from mycelium.dream.router import create_dream_router
 
         app.include_router(
             create_dream_router(substrate, store), prefix="/api"
@@ -107,7 +112,7 @@ def main() -> None:
         def _get_last_session_context() -> str:
             """Get session context from last processed commit."""
             try:
-                from dream.inbox import InboxProcessor
+                from mycelium.dream.inbox import InboxProcessor
                 proc = InboxProcessor()
                 return proc.last_session_context()
             except Exception:
@@ -119,25 +124,18 @@ def main() -> None:
                 store.save_intersection(ix)
                 # Also persist dream_log entry so auto-wake can find it
                 try:
-                    store.save_dream_log_entry(
-                        str(ix.id), ix.discovered_at.isoformat(),
-                    )
+                    with store._conn() as conn:
+                        conn.execute(
+                            "INSERT OR IGNORE INTO dream_log"
+                            " (intersection_id, discovered_at, description)"
+                            " VALUES (?,?,?)",
+                            (str(ix.id), ix.discovered_at.isoformat(), ""),
+                        )
                 except Exception as exc:
                     logger.warning("Failed to persist dream_log entry: %s", exc)
             logger.info("Persisted %d dream discoveries to disk", len(discoveries))
 
-            # Auto-wake high-significance discoveries
-            try:
-                from dream.wake import auto_wake
-                ctx = _get_last_session_context()
-                verified = auto_wake(
-                    discoveries, substrate, store,
-                    session_context=ctx,
-                )
-                if verified > 0:
-                    logger.info("Auto-wake: %d connections verified", verified)
-            except Exception as exc:
-                logger.error("Auto-wake failed: %s", exc)
+            logger.info("Auto-wake disabled (using queue-based evaluation)")
 
         dreamer = Dreamer(
             substrate=substrate,
@@ -149,23 +147,23 @@ def main() -> None:
         dreamer.start()
         logger.info("Dreamer daemon started (auto-consolidation)")
 
-    logger.info("=" * 50)
-    logger.info("DREAM AGENT SERVICE")
-    logger.info("=" * 50)
-    logger.info("API:  http://%s:%d/api/health", args.host, args.port)
-    logger.info("Docs: http://%s:%d/docs", args.host, args.port)
+    print("\n" + "=" * 50)
+    print("MYCELIUM SERVICE")
+    print("=" * 50)
+    print(f"  API:  http://{args.host}:{args.port}/api/health")
+    print(f"  Docs: http://{args.host}:{args.port}/docs")
     if args.db:
-        logger.info("DB:   %s", args.db)
+        print(f"  DB:   {args.db}")
     if store is not None:
-        logger.info("Dream: http://%s:%d/api/dream/unseen", args.host, args.port)
+        print(f"  Dream: http://{args.host}:{args.port}/api/dream/unseen")
     if dreamer is not None:
-        logger.info("Dreamer: active (30s idle, 5000 pairs/cycle, auto-wake)")
-    logger.info("=" * 50)
-    logger.info("The substrate dreams.")
+        print(f"  Dreamer: active (30s idle, 5000 pairs/cycle, auto-wake)")
+    print(f"  Viz:  {'disabled' if args.no_viz else 'TODO'}")
+    print("=" * 50)
+    print("  The future has to be free.\n")
 
     uvicorn.run(app, host=args.host, port=args.port)
 
 
 if __name__ == "__main__":
     main()
-
