@@ -7,12 +7,11 @@ bound to specific instances — stateless and testable.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, HTTPException
-
-logger = logging.getLogger(__name__)
 from pydantic import BaseModel, Field
 
 from mycelium.api.inspire import (
@@ -25,6 +24,8 @@ from mycelium.core.cell import CellID
 if TYPE_CHECKING:
     from mycelium.core.substrate import Substrate
     from mycelium.storage.store import SubstrateStore
+
+logger = logging.getLogger(__name__)
 
 
 # -- Request/Response schemas ----------------------------------------
@@ -306,8 +307,9 @@ def create_dream_router(
         if not req.query.strip():
             raise HTTPException(status_code=400, detail="Query cannot be empty")
 
-        # Get lateral connections via inspire logic
-        result = _inspire_on_substrate(
+        # Get lateral connections via inspire logic (offload to thread to avoid blocking)
+        result = await asyncio.to_thread(
+            _inspire_on_substrate,
             substrate, req.query, k=req.top_k, max_lateral=req.top_k,
         )
         connections = result.lateral_connections
@@ -353,7 +355,7 @@ def create_dream_router(
 
             # Apply energy effects to parent cells (match by text prefix)
             if verified is not None:
-                for cell in substrate._cells.values():
+                for cell in substrate.get_all_active_cells():
                     if (
                         cell.text
                         and conn.cell_text
@@ -365,7 +367,7 @@ def create_dream_router(
                             cell.energy = max(0.0, cell.energy - DECAY_REJECTED)
                         break
 
-                for cell in substrate._cells.values():
+                for cell in substrate.get_all_active_cells():
                     if (
                         cell.text
                         and conn.connected_to_text
@@ -380,21 +382,13 @@ def create_dream_router(
             # Persist wake verification to dream_log
             if verified is not None and conn.cell_id and conn.connected_to_id:
                 try:
-                    with store._conn() as db:
-                        # Find dream_log entry by matching parent cells
-                        row = db.execute(
-                            """SELECT dl.id FROM dream_log dl
-                               JOIN intersections ix ON dl.intersection_id = ix.id
-                               WHERE (ix.parent_a = ? AND ix.parent_b = ?)
-                                  OR (ix.parent_a = ? AND ix.parent_b = ?)
-                               ORDER BY dl.id DESC LIMIT 1""",
-                            (conn.cell_id, conn.connected_to_id,
-                             conn.connected_to_id, conn.cell_id),
-                        ).fetchone()
-                        if row:
-                            store.set_wake_verification(
-                                row["id"], verified, reasoning,
-                            )
+                    row = store.find_dream_log_by_cells(
+                        conn.cell_id, conn.connected_to_id,
+                    )
+                    if row:
+                        store.set_wake_verification(
+                            row["id"], verified, reasoning,
+                        )
                 except Exception as exc:
                     logger.warning("Failed to persist wake result: %s", exc)
 
@@ -417,3 +411,4 @@ def create_dream_router(
         )
 
     return router
+

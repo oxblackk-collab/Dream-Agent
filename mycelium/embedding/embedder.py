@@ -117,3 +117,4 @@ class MockEmbedder:
     def semantic_distance(self, a: EmbeddingVector, b: EmbeddingVector) -> float:
         dot = float(np.dot(a, b))
         return float(1.0 - dot)
+

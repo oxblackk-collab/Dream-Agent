@@ -8,10 +8,17 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s -- %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 
 def main() -> None:
@@ -25,14 +32,14 @@ def main() -> None:
     try:
         from dream.menubar import DreamMenubar
     except ImportError:
-        print("Error: rumps not installed.")
-        print("Install with: pip install 'dream-agent[menubar]'")
-        print("Or: pip install rumps")
+        logger.error("rumps not installed.")
+        logger.error("Install with: pip install 'dream-agent[menubar]'")
+        logger.error("Or: pip install rumps")
         sys.exit(1)
 
-    print("Starting Dream menubar...")
-    print(f"  API: {args.api}")
-    print("  Look for the mushroom icon in your menu bar")
+    logger.info("Starting Dream menubar...")
+    logger.info("API: %s", args.api)
+    logger.info("Look for the mushroom icon in your menu bar")
 
     app = DreamMenubar(api_base=args.api)
     app.run()
@@ -40,3 +47,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

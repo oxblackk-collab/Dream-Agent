@@ -80,3 +80,4 @@ class ProvenanceAnchor:
         """Verify a snapshot matches a previously anchored root."""
         current_root = compute_snapshot_merkle(snapshot)
         return current_root == expected_root
+

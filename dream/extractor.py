@@ -225,3 +225,4 @@ def _split_chat_exchanges(text: str) -> list[str]:
 
     # Fallback: return whole text as single exchange
     return [text]
+

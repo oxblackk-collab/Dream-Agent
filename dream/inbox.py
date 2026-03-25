@@ -170,3 +170,4 @@ class InboxProcessor:
         dest = self.processed_dir / f"{ts}_{prefix}_{path.name}"
         shutil.move(str(path), str(dest))
         logger.info("Moved %s -> %s", path.name, dest.name)
+

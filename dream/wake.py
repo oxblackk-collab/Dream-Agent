@@ -21,7 +21,6 @@ import os
 import re
 import shutil
 import subprocess
-import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -513,16 +512,11 @@ def auto_wake(
 
         # Find dream_log entry for this intersection and record verification
         try:
-            with store._conn() as conn:
-                row = conn.execute(
-                    "SELECT id FROM dream_log WHERE intersection_id = ? "
-                    "ORDER BY id DESC LIMIT 1",
-                    (str(ix.id),),
-                ).fetchone()
-                if row:
-                    store.set_wake_verification(
-                        row["id"], wr.verified, wr.reasoning,
-                    )
+            row = store.find_dream_log_by_intersection(str(ix.id))
+            if row:
+                store.set_wake_verification(
+                    row["id"], wr.verified, wr.reasoning,
+                )
         except Exception as exc:
             logger.warning("Failed to record wake verification: %s", exc)
 
@@ -532,3 +526,4 @@ def auto_wake(
     )
 
     return verified_count
+

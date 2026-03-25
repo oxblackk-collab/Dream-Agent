@@ -85,3 +85,4 @@ def compute_snapshot_merkle(snapshot: SubstrateSnapshot) -> str:
         root[:16] if root else "(empty)",
     )
     return root
+

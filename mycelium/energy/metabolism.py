@@ -261,3 +261,4 @@ class Metabolism:
     def is_vital(self, cell: CognitiveCell) -> bool:
         """True if cell has enough energy to participate in Recognize."""
         return cell.energy >= self.vitality_minimum
+

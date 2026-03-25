@@ -119,13 +119,9 @@ def main() -> None:
                 store.save_intersection(ix)
                 # Also persist dream_log entry so auto-wake can find it
                 try:
-                    with store._conn() as conn:
-                        conn.execute(
-                            "INSERT OR IGNORE INTO dream_log"
-                            " (intersection_id, discovered_at, description)"
-                            " VALUES (?,?,?)",
-                            (str(ix.id), ix.discovered_at.isoformat(), ""),
-                        )
+                    store.save_dream_log_entry(
+                        str(ix.id), ix.discovered_at.isoformat(),
+                    )
                 except Exception as exc:
                     logger.warning("Failed to persist dream_log entry: %s", exc)
             logger.info("Persisted %d dream discoveries to disk", len(discoveries))
@@ -153,22 +149,23 @@ def main() -> None:
         dreamer.start()
         logger.info("Dreamer daemon started (auto-consolidation)")
 
-    print("\n" + "=" * 50)
-    print("DREAM AGENT SERVICE")
-    print("=" * 50)
-    print(f"  API:  http://{args.host}:{args.port}/api/health")
-    print(f"  Docs: http://{args.host}:{args.port}/docs")
+    logger.info("=" * 50)
+    logger.info("DREAM AGENT SERVICE")
+    logger.info("=" * 50)
+    logger.info("API:  http://%s:%d/api/health", args.host, args.port)
+    logger.info("Docs: http://%s:%d/docs", args.host, args.port)
     if args.db:
-        print(f"  DB:   {args.db}")
+        logger.info("DB:   %s", args.db)
     if store is not None:
-        print(f"  Dream: http://{args.host}:{args.port}/api/dream/unseen")
+        logger.info("Dream: http://%s:%d/api/dream/unseen", args.host, args.port)
     if dreamer is not None:
-        print(f"  Dreamer: active (30s idle, 5000 pairs/cycle, auto-wake)")
-    print("=" * 50)
-    print("  The substrate dreams.\n")
+        logger.info("Dreamer: active (30s idle, 5000 pairs/cycle, auto-wake)")
+    logger.info("=" * 50)
+    logger.info("The substrate dreams.")
 
     uvicorn.run(app, host=args.host, port=args.port)
 
 
 if __name__ == "__main__":
     main()
+

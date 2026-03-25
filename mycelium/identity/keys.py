@@ -106,3 +106,4 @@ class ParticipantIdentity:
         except (InvalidSignature, ValueError):
             return False
         return True
+

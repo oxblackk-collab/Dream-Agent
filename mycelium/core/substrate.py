@@ -529,6 +529,11 @@ class Substrate:
     # Query API
     # ──────────────────────────────────────────────
 
+    def get_all_active_cells(self) -> list[CognitiveCell]:
+        """Return all cells (including non-active) for iteration."""
+        with self._lock:
+            return list(self._cells.values())
+
     def get_cell(self, cell_id: CellID) -> CognitiveCell | None:
         """Return a single cell by ID, or None if not found."""
         with self._lock:
@@ -572,3 +577,4 @@ class Substrate:
                 if ix.parent_a_id == cell_id
                 or ix.parent_b_id == cell_id
             ]
+

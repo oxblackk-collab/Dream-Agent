@@ -37,22 +37,9 @@ async def main() -> None:
     store = SubstrateStore(db_path=DB_PATH)
 
     # Get distinct high-significance unverified dream entries
-    with store._conn() as conn:
-        rows = conn.execute(
-            """
-            SELECT dl.id AS dream_id, dl.intersection_id,
-                   ix.significance, ix.overlap, ix.novelty,
-                   ix.parent_a, ix.parent_b
-            FROM dream_log dl
-            JOIN intersections ix ON dl.intersection_id = ix.id
-            WHERE dl.wake_verified IS NULL
-              AND ix.significance >= ?
-            GROUP BY ix.parent_a, ix.parent_b
-            ORDER BY ix.significance DESC
-            LIMIT ?
-            """,
-            (args.min_sig, args.limit),
-        ).fetchall()
+    rows = store.get_unverified_dreams(
+        min_significance=args.min_sig, limit=args.limit,
+    )
 
     if not rows:
         logger.info("No unverified dreams above significance %.2f", args.min_sig)
@@ -65,37 +52,30 @@ async def main() -> None:
     dream_ids: list[int] = []
     ix_ids: list[str] = []
 
-    with store._conn() as conn:
-        for row in rows:
-            row = dict(row)
-            cell_a = conn.execute(
-                "SELECT * FROM cells WHERE id = ?", (row["parent_a"],)
-            ).fetchone()
-            cell_b = conn.execute(
-                "SELECT * FROM cells WHERE id = ?", (row["parent_b"],)
-            ).fetchone()
-            if not cell_a or not cell_b:
-                logger.warning("Missing cell for pair %s / %s", row["parent_a"], row["parent_b"])
-                continue
+    for row in rows:
+        cell_a = store.get_cell_raw(row["parent_a"])
+        cell_b = store.get_cell_raw(row["parent_b"])
+        if not cell_a or not cell_b:
+            logger.warning("Missing cell for pair %s / %s", row["parent_a"], row["parent_b"])
+            continue
 
-            cell_a, cell_b = dict(cell_a), dict(cell_b)
-            connections.append(LateralConnection(
-                cell_text=(cell_a.get("text") or "")[:300],
-                cell_domain=cell_a.get("domain", ""),
-                cell_source=cell_a.get("source", ""),
-                cell_confidence=round(cell_a.get("confidence", 0.5), 3),
-                cell_energy=round(cell_a.get("energy", 1.0), 3),
-                connected_to_text=(cell_b.get("text") or "")[:300],
-                connected_to_domain=cell_b.get("domain", ""),
-                connected_to_source=cell_b.get("source", ""),
-                intersection_significance=round(row["significance"], 4),
-                intersection_overlap=round(row["overlap"], 4),
-                intersection_novelty=round(row["novelty"], 4),
-                cell_id=row["parent_a"],
-                connected_to_id=row["parent_b"],
-            ))
-            dream_ids.append(row["dream_id"])
-            ix_ids.append(row["intersection_id"])
+        connections.append(LateralConnection(
+            cell_text=(cell_a.get("text") or "")[:300],
+            cell_domain=cell_a.get("domain", ""),
+            cell_source=cell_a.get("source", ""),
+            cell_confidence=round(cell_a.get("confidence", 0.5), 3),
+            cell_energy=round(cell_a.get("energy", 1.0), 3),
+            connected_to_text=(cell_b.get("text") or "")[:300],
+            connected_to_domain=cell_b.get("domain", ""),
+            connected_to_source=cell_b.get("source", ""),
+            intersection_significance=round(row["significance"], 4),
+            intersection_overlap=round(row["overlap"], 4),
+            intersection_novelty=round(row["novelty"], 4),
+            cell_id=row["parent_a"],
+            connected_to_id=row["parent_b"],
+        ))
+        dream_ids.append(row["dream_id"])
+        ix_ids.append(row["intersection_id"])
 
     if not connections:
         logger.info("No valid connections to evaluate")
@@ -141,14 +121,10 @@ async def main() -> None:
         if not args.dry_run and wr.index < len(dream_ids):
             # Persist verification to all dream_log entries with this intersection_id
             ix_id = ix_ids[wr.index]
-            with store._conn() as db_conn:
-                matching = db_conn.execute(
-                    "SELECT id FROM dream_log WHERE intersection_id = ? AND wake_verified IS NULL",
-                    (ix_id,),
-                ).fetchall()
-                for m in matching:
-                    store.set_wake_verification(m["id"], wr.verified, wr.reasoning)
-            logger.info("    Persisted to %d dream_log entries (ix=%s)", len(matching), ix_id[:20])
+            matching_ids = store.get_unverified_dream_log_ids(ix_id)
+            for mid in matching_ids:
+                store.set_wake_verification(mid, wr.verified, wr.reasoning)
+            logger.info("    Persisted to %d dream_log entries (ix=%s)", len(matching_ids), ix_id[:20])
 
     logger.info(
         "Wake verification complete: %d/%d verified (backend=%s, dry_run=%s)",
@@ -158,3 +134,4 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+

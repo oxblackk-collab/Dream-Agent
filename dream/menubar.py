@@ -246,13 +246,13 @@ class DreamMenubar:
         script_path = prompt_path.replace(".txt", ".command")
         with open(script_path, "w") as f:
             f.write("#!/bin/bash\n")
-            f.write(f'claude "$(cat \'{prompt_path}\')"\n')
+            f.write(f'cat "{prompt_path}" | claude\n')
 
         os.chmod(script_path, 0o755)
 
         try:
             subprocess.run(["open", script_path], timeout=10)
-        except Exception:
+        except (subprocess.SubprocessError, OSError):
             logger.warning("Failed to open Terminal for insight exploration")
 
     def _on_mark_seen(self, _sender) -> None:
@@ -282,3 +282,4 @@ class DreamMenubar:
     def run(self) -> None:
         """Start the menubar app (blocking)."""
         self.app.run()
+

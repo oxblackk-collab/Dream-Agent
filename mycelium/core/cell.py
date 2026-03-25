@@ -166,3 +166,4 @@ class CognitiveCell:
         """Record an access event."""
         self.last_accessed = datetime.now(tz=UTC)
         self.access_count += 1
+
