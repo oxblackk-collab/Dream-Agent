@@ -135,7 +135,10 @@ def main() -> None:
                     logger.warning("Failed to persist dream_log entry: %s", exc)
             logger.info("Persisted %d dream discoveries to disk", len(discoveries))
 
-            logger.info("Auto-wake disabled (using queue-based evaluation)")
+            from mycelium.dream.wake import auto_wake
+            ctx = _get_last_session_context()
+            verified = auto_wake(discoveries, substrate, store, session_context=ctx)
+            logger.info("Auto-wake: %d verified from %d discoveries", verified, len(discoveries))
 
         dreamer = Dreamer(
             substrate=substrate,
