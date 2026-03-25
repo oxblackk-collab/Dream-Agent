@@ -36,7 +36,6 @@ if TYPE_CHECKING:
     from collections.abc import Generator
 
     from mycelium.core.substrate import SubstrateSnapshot
-    from mycelium.provenance.anchor import AnchorRecord
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +86,9 @@ CREATE TABLE IF NOT EXISTS dream_log (
     discovered_at   TEXT NOT NULL,
     description     TEXT NOT NULL DEFAULT ''
 );
+
+CREATE INDEX IF NOT EXISTS idx_dream_log_wake_verified ON dream_log(wake_verified);
+CREATE INDEX IF NOT EXISTS idx_dream_log_intersection_id ON dream_log(intersection_id);
 
 CREATE TABLE IF NOT EXISTS signatures (
     cell_id     TEXT PRIMARY KEY,
@@ -295,7 +297,12 @@ class SubstrateStore:
     # ──────────────────────────────────────────────
 
     def save_snapshot(self, snapshot: SubstrateSnapshot) -> None:
-        """Record a substrate state snapshot."""
+        """Record a substrate state snapshot.
+
+        Uses batch executemany for cells and intersections — much faster
+        than individual save_cell/save_intersection calls (single transaction,
+        single connection, no per-row overhead).
+        """
         with self._conn() as conn:
             # Batch upsert cells
             cell_rows = []
@@ -408,7 +415,11 @@ class SubstrateStore:
         self, min_significance: float = 0.0, limit: int = 50,
         verified_only: bool = False,
     ) -> list[dict]:
-        """Return dream_log entries that haven't been seen yet."""
+        """Return dream_log entries that haven't been seen yet.
+
+        Joins with intersections to get significance and parent cell info.
+        If verified_only=True, only returns wake-verified entries.
+        """
         with self._conn() as conn:
             query = """
                 SELECT dl.id, dl.intersection_id, dl.discovered_at, dl.description,
@@ -453,86 +464,6 @@ class SubstrateStore:
                 (int(verified), reasoning, dream_id),
             )
 
-    def find_dream_log_by_cells(
-        self, cell_a_id: str, cell_b_id: str,
-    ) -> dict | None:
-        """Find the most recent dream_log entry matching a pair of parent cells."""
-        with self._conn() as conn:
-            row = conn.execute(
-                """SELECT dl.id FROM dream_log dl
-                   JOIN intersections ix ON dl.intersection_id = ix.id
-                   WHERE (ix.parent_a = ? AND ix.parent_b = ?)
-                      OR (ix.parent_a = ? AND ix.parent_b = ?)
-                   ORDER BY dl.id DESC LIMIT 1""",
-                (cell_a_id, cell_b_id, cell_b_id, cell_a_id),
-            ).fetchone()
-        return dict(row) if row else None
-
-    def find_dream_log_by_intersection(
-        self, intersection_id: str,
-    ) -> dict | None:
-        """Find the most recent dream_log entry for an intersection ID."""
-        with self._conn() as conn:
-            row = conn.execute(
-                "SELECT id FROM dream_log WHERE intersection_id = ? "
-                "ORDER BY id DESC LIMIT 1",
-                (intersection_id,),
-            ).fetchone()
-        return dict(row) if row else None
-
-    def get_unverified_dreams(
-        self, min_significance: float = 0.0, limit: int = 50,
-    ) -> list[dict]:
-        """Return unverified dream_log entries with cell data for wake evaluation."""
-        with self._conn() as conn:
-            rows = conn.execute(
-                """
-                SELECT dl.id AS dream_id, dl.intersection_id,
-                       ix.significance, ix.overlap, ix.novelty,
-                       ix.parent_a, ix.parent_b
-                FROM dream_log dl
-                JOIN intersections ix ON dl.intersection_id = ix.id
-                WHERE dl.wake_verified IS NULL
-                  AND ix.significance >= ?
-                GROUP BY ix.parent_a, ix.parent_b
-                ORDER BY ix.significance DESC
-                LIMIT ?
-                """,
-                (min_significance, limit),
-            ).fetchall()
-        return [dict(r) for r in rows]
-
-    def get_unverified_dream_log_ids(
-        self, intersection_id: str,
-    ) -> list[int]:
-        """Return IDs of unverified dream_log entries for an intersection."""
-        with self._conn() as conn:
-            rows = conn.execute(
-                "SELECT id FROM dream_log WHERE intersection_id = ? AND wake_verified IS NULL",
-                (intersection_id,),
-            ).fetchall()
-        return [r["id"] for r in rows]
-
-    def get_cell_raw(self, cell_id: str) -> dict | None:
-        """Return raw cell row as dict, or None."""
-        with self._conn() as conn:
-            row = conn.execute(
-                "SELECT * FROM cells WHERE id = ?", (cell_id,),
-            ).fetchone()
-        return dict(row) if row else None
-
-    def save_dream_log_entry(
-        self, intersection_id: str, discovered_at: str, description: str = "",
-    ) -> None:
-        """Insert a dream_log entry (ignores duplicates)."""
-        with self._conn() as conn:
-            conn.execute(
-                "INSERT OR IGNORE INTO dream_log"
-                " (intersection_id, discovered_at, description)"
-                " VALUES (?,?,?)",
-                (intersection_id, discovered_at, description),
-            )
-
     def get_dream_log(
         self,
         limit: int = 100,
@@ -562,7 +493,7 @@ class SubstrateStore:
     # Merkle anchor persistence
     # ──────────────────────────────────────────────
 
-    def save_anchor(self, record: AnchorRecord) -> None:
+    def save_anchor(self, record: object) -> None:
         """Store a Merkle root anchor."""
         with self._conn() as conn:
             conn.execute(
@@ -570,10 +501,10 @@ class SubstrateStore:
                 " (merkle_root, cell_count, anchored_at, tx_hash)"
                 " VALUES (?,?,?,?)",
                 (
-                    record.merkle_root,
-                    record.cell_count,
-                    record.anchored_at.isoformat(),
-                    record.tx_hash,
+                    record.merkle_root,  # type: ignore[union-attr]
+                    record.cell_count,  # type: ignore[union-attr]
+                    record.anchored_at.isoformat(),  # type: ignore[union-attr]
+                    record.tx_hash,  # type: ignore[union-attr]
                 ),
             )
 
@@ -598,4 +529,3 @@ class SubstrateStore:
             )
             for row in rows
         ]
-

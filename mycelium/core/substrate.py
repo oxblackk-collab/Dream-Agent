@@ -47,7 +47,7 @@ _DEFAULT_RADIUS_GROWTH_RATE = 0.01
 # but produce no energy boost. Modelled on human dreaming: the prefrontal
 # cortex discards incoherent connections on waking, only genuine insights
 # (high overlap + novelty + coherence) survive and energise the substrate.
-# At 0.50 ~ median significance -> top 50% of dream connections boost energy.
+# At 0.50 ≈ median significance → top 50% of dream connections boost energy.
 _DEFAULT_DREAM_SIGNIFICANCE_THRESHOLD = 0.50
 
 
@@ -322,7 +322,7 @@ class Substrate:
                 self._dirty_cells.add(cid)
             for ix in intersections:
                 self._dirty_intersections.add(ix.id)
-                # Parents got energy boost -> dirty
+                # Parents got energy boost → dirty
                 self._dirty_cells.add(ix.parent_a_id)
                 self._dirty_cells.add(ix.parent_b_id)
 
@@ -338,7 +338,7 @@ class Substrate:
         """One time step of the substrate.
 
         1. Decay energy of all active cells
-        2. EF-005: cells below archive threshold -> ARCHIVED (not destroyed)
+        2. EF-005: cells below archive threshold → ARCHIVED (not destroyed)
         3. Increment tick counter
         """
         with self._lock:
@@ -356,6 +356,12 @@ class Substrate:
                 self._dirty_cells.add(cid)
                 logger.debug("tick: cell %s archived (energy depleted)", cid)
 
+            # Note: energy decay changes are tiny per tick. We only mark
+            # archived cells as dirty here. Cells that merely decayed
+            # will be saved on the next full snapshot or when they're
+            # touched by ingest/consolidate. This keeps incremental
+            # saves fast — otherwise every tick dirties the entire substrate.
+
             self._tick_count += 1
 
     def consolidate(self, pairs_per_cycle: int = 100) -> list[Intersection]:
@@ -363,12 +369,14 @@ class Substrate:
 
         EF-005: Includes ARCHIVED cells as candidates — dreams can rescue
         knowledge that has gone quiet. If an archived cell is found relevant,
-        it gets reactivated (ARCHIVED -> ACTIVE). If the partner cell semantically
+        it gets reactivated (ARCHIVED → ACTIVE). If the partner cell semantically
         dominates it (higher confidence + deep overlap), it becomes SUPERSEDED
         instead — preserved as history, not erased.
 
         Systematically compare cell pairs that have never been compared,
         prioritizing overlapping pairs by ascending distance (closest first).
+        EF-007: fixed sort order — cross-domain-first caused dream_discoveries=0
+        because non-overlapping pairs dominated the batch.
         Returns newly discovered intersections.
         """
         with self._lock:
@@ -390,6 +398,15 @@ class Substrate:
             if len(dream_cells) < 2:
                 return []
 
+            # Collect candidate pairs (never compared) that still overlap.
+            # Uses the substrate's memory of compared pairs — no reconstruction.
+            # EF-007: prioritize by ASCENDING distance — pairs most likely to
+            # overlap get processed first. The dream is for latent *nearby*
+            # connections that were missed during ingest (max_neighbors=12 only
+            # sees each cell's closest 12 neighbors; the rest never got compared).
+            # Note: distant pairs that don't overlap are NOT added to
+            # _compared_pairs — the substrate only remembers meaningful
+            # comparisons, not exhaustive scans. This keeps memory O(N*k).
             candidates: list[tuple[float, CognitiveCell, CognitiveCell]] = []
             for i, ca in enumerate(dream_cells):
                 for cb in dream_cells[i + 1 :]:
@@ -418,12 +435,19 @@ class Substrate:
 
                 self._dirty_intersections.add(ix.id)
 
+                text_a = ca.text or ca.origin.source
+                text_b = cb.text or cb.origin.source
+                desc_a = (text_a[:100] + "...") if len(text_a) > 100 else text_a
+                desc_b = (text_b[:100] + "...") if len(text_b) > 100 else text_b
+                domain_info = ""
+                if ca.domain and cb.domain and ca.domain != cb.domain:
+                    domain_info = f" [{ca.domain} ↔ {cb.domain}]"
+                dream_desc = f"{desc_a} ↔ {desc_b}{domain_info} (sig={ix.significance:.3f})"
+
                 entry = DreamEntry(
                     intersection_id=ix.id,
                     discovered_at=datetime.now(tz=UTC),
-                    description=(
-                        f"dream: {ca.id[:8]}~{cb.id[:8]} sig={ix.significance:.3f}"
-                    ),
+                    description=dream_desc,
                 )
                 self._dream_log.append(entry)
                 self._dirty_dream_entries.append(entry)
@@ -432,7 +456,7 @@ class Substrate:
                 for archived, partner in [(ca, cb), (cb, ca)]:
                     if archived.state == CellState.ARCHIVED:
                         # Dominated? partner has significantly higher confidence
-                        # and deep overlap -> this knowledge is superseded
+                        # and deep overlap → this knowledge is superseded
                         if (
                             partner.confidence > archived.confidence * 1.2
                             and ix.overlap > 0.6
@@ -456,6 +480,10 @@ class Substrate:
 
                 # EF-008: Wake-filter — only boost cells if the dream connection
                 # is significant enough to survive waking scrutiny.
+                # Low-significance intersections are registered (the dream
+                # happened) but produce no energy boost (discarded on waking).
+                # This models how humans discard incoherent dream connections
+                # while retaining genuine insights that hold up to reality.
                 if ix.significance >= self._dream_significance_threshold:
                     self._metabolism.on_consolidation(ca)
                     self._metabolism.on_consolidation(cb)
@@ -470,7 +498,12 @@ class Substrate:
             return new_intersections
 
     def apply_bulk_decay(self, n_ticks: int) -> list[CellID]:
-        """Apply n_ticks of adaptive energy decay in one shot."""
+        """Apply n_ticks of adaptive energy decay in one shot.
+
+        Each cell decays at its own rate based on access_count (EF-006).
+        Frequently accessed cells lose less energy than rarely accessed ones,
+        even across long temporal gaps — this is when it matters most.
+        """
         with self._lock:
             archived = self._metabolism.apply_bulk_decay(
                 self._cells, n_ticks
@@ -489,7 +522,11 @@ class Substrate:
             )
 
     def get_incremental_snapshot(self) -> SubstrateSnapshot:
-        """Return snapshot with only dirty (new/changed) cells and intersections."""
+        """Return snapshot with only dirty (new/changed) cells and intersections.
+
+        After calling this, dirty tracking is reset. Use this for fast
+        incremental saves — only persist what changed since last save.
+        """
         with self._lock:
             dirty_cells = {
                 cid: self._cells[cid]
@@ -516,7 +553,11 @@ class Substrate:
             )
 
     def get_bond(self, participant_id: str) -> list[CognitiveCell]:
-        """Return cluster of cells associated with a participant."""
+        """Return cluster of cells associated with a participant.
+
+        The cognitive bond is the emergent topological cluster formed
+        through repeated interaction with a specific participant.
+        """
         with self._lock:
             return [
                 c
@@ -529,11 +570,6 @@ class Substrate:
     # Query API
     # ──────────────────────────────────────────────
 
-    def get_all_active_cells(self) -> list[CognitiveCell]:
-        """Return all cells (including non-active) for iteration."""
-        with self._lock:
-            return list(self._cells.values())
-
     def get_cell(self, cell_id: CellID) -> CognitiveCell | None:
         """Return a single cell by ID, or None if not found."""
         with self._lock:
@@ -545,7 +581,11 @@ class Substrate:
         k: int = 10,
         active_only: bool = True,
     ) -> list[tuple[CognitiveCell, float]]:
-        """Find k nearest cells to an embedding, with distances."""
+        """Find k nearest cells to an embedding, with distances.
+
+        Returns list of (cell, distance) sorted by distance ascending.
+        Embeddings are unit vectors, so distance = euclidean ≈ cosine.
+        """
         with self._lock:
             candidates = []
             for cell in self._cells.values():
@@ -560,7 +600,10 @@ class Substrate:
     def search_by_text(
         self, query: str, k: int = 10, active_only: bool = True
     ) -> list[tuple[CognitiveCell, float]]:
-        """Embed query text, then find nearest cells."""
+        """Embed query text, then find nearest cells.
+
+        Convenience method: embed + find_neighbors in one call.
+        """
         embedding = self._embedder.embed(query)
         return self.find_neighbors(
             embedding, k=k, active_only=active_only
@@ -577,4 +620,3 @@ class Substrate:
                 if ix.parent_a_id == cell_id
                 or ix.parent_b_id == cell_id
             ]
-
