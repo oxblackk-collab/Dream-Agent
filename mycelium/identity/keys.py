@@ -4,7 +4,7 @@ Each participant (human or AI) has a keypair. The public key IS the
 participant's identity — no external registry needed. The private key
 signs cell hashes, proving authorship.
 
-This maps to The Cognitive Chain's "key sovereignty": the bond
+This maps to The Cognitive Chain's "soberanía de claves": the bond
 between a human and an AI is cryptographically portable. Neither party
 depends on a platform to prove the relationship exists.
 """
@@ -106,4 +106,3 @@ class ParticipantIdentity:
         except (InvalidSignature, ValueError):
             return False
         return True
-

@@ -4,7 +4,7 @@ Shows a mushroom icon in the menu bar. Polls the Mycelium API
 for wake-verified dream discoveries and shows a badge when
 Claude has confirmed genuine insights.
 
-Requires: pip install 'dream-agent[menubar]'
+Requires: pip install 'mycelium[dream]'
 """
 
 from __future__ import annotations
@@ -74,10 +74,12 @@ class DreamMenubar:
         self._status_item = rumps.MenuItem("Dream: connecting...")
         self._insights_header = rumps.MenuItem("No verified insights")
         self._mark_seen_item = rumps.MenuItem(
-            "Mark All Seen", callback=self._on_mark_seen,
+            "Mark All Seen",
+            callback=self._on_mark_seen,
         )
         self._refresh_item = rumps.MenuItem(
-            "Refresh Now", callback=self._on_refresh,
+            "Refresh Now",
+            callback=self._on_refresh,
         )
 
         self.app.menu = [
@@ -158,7 +160,7 @@ class DreamMenubar:
             label = reasoning[:70] + "..." if len(reasoning) > 70 else reasoning
             if not label:
                 label = entry.get("description", "Connection found")[:70]
-            title = f"  {sig:.2f} -- {label}"
+            title = f"  ⚡ {sig:.2f} — {label}"
 
             item = rumps.MenuItem(
                 title,
@@ -166,19 +168,19 @@ class DreamMenubar:
             )
             self._insight_menu_items.append(item)
             self.app.menu.insert_before(
-                "Mark All Seen", item,
+                "Mark All Seen",
+                item,
             )
 
         # Update header AFTER inserting items (avoids key mismatch)
-        self._insights_header.title = f"{count} insight{'s' if count != 1 else ''}"
+        self._insights_header.title = f"💡 {count} insight{'s' if count != 1 else ''}"
 
     def _notify_new_insights(self) -> None:
         """Send macOS notification for NEW insights not yet notified."""
         import rumps
 
         new_entries = [
-            e for e in self._unseen_entries
-            if e.get("id") not in self._notified_ids
+            e for e in self._unseen_entries if e.get("id") not in self._notified_ids
         ]
 
         if not new_entries:
@@ -191,19 +193,21 @@ class DreamMenubar:
             sig = entry.get("significance", 0)
 
             rumps.notification(
-                title="Dream",
+                title="Dream 🍄✨",
                 subtitle=f"Verified insight (sig={sig:.3f})",
                 message=reasoning,
             )
 
     def _make_explore_callback(self, entry: dict):
         """Return a callback closure for a specific insight entry."""
+
         def callback(_sender):
             threading.Thread(
                 target=self._explore_insight,
                 args=(entry,),
                 daemon=True,
             ).start()
+
         return callback
 
     def _explore_insight(self, entry: dict) -> None:
@@ -229,11 +233,10 @@ class DreamMenubar:
             f"{reasoning}\n\n"
             f"Cell A ({domain_a}): {text_a}\n"
             f"Cell B ({domain_b}): {text_b}\n\n"
-            f"Explore this connection -- what patterns or applications do you see?"
+            f"Explore this connection — what patterns or applications do you see?"
         )
 
-        # Write prompt to temp file, then a launcher .command script.
-        # .command files open natively in Terminal.app (no AppleScript needed).
+        # Create launcher script that opens opencode with the insight prompt
         with tempfile.NamedTemporaryFile(
             mode="w",
             prefix="dream_insight_",
@@ -243,22 +246,30 @@ class DreamMenubar:
             f.write(prompt)
             prompt_path = f.name
 
-        script_path = prompt_path.replace(".txt", ".command")
+        # Create bash script to launch opencode with the insight via --prompt flag
+        script_path = prompt_path.replace(".txt", ".sh")
         with open(script_path, "w") as f:
             f.write("#!/bin/bash\n")
-            f.write(f'cat "{prompt_path}" | claude\n')
+            f.write("source ~/.zshrc 2>/dev/null || source ~/.bashrc 2>/dev/null\n")
+            f.write("cd ~\n")
+            f.write(f'exec opencode --prompt "$(cat "{prompt_path}")"\n')
 
         os.chmod(script_path, 0o755)
 
+        # Launch using 'open -a Ghostty' (same as manual test that worked)
         try:
-            subprocess.run(["open", script_path], timeout=10)
-        except (subprocess.SubprocessError, OSError):
-            logger.warning("Failed to open Terminal for insight exploration")
+            logger.info(f"Launching ghostty with opencode")
+            subprocess.Popen(["open", "-a", "Ghostty", script_path])
+            logger.info("Ghostty launched")
+        except Exception as e:
+            logger.error(f"Failed to launch ghostty: {e}")
 
     def _on_mark_seen(self, _sender) -> None:
         """Mark all unseen dreams as seen."""
         result = _api_post(
-            self.api_base, "/api/dream/mark-seen", {"dream_ids": None},
+            self.api_base,
+            "/api/dream/mark-seen",
+            {"dream_ids": None},
         )
         if result:
             marked = result.get("marked", 0)
@@ -273,6 +284,7 @@ class DreamMenubar:
             self._insights_header.title = "No verified insights"
 
             import rumps
+
             rumps.notification("Dream", f"Marked {marked} as seen", "")
 
     def _on_refresh(self, _sender) -> None:
@@ -282,4 +294,3 @@ class DreamMenubar:
     def run(self) -> None:
         """Start the menubar app (blocking)."""
         self.app.run()
-

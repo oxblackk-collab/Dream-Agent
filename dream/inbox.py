@@ -53,16 +53,21 @@ class InboxProcessor:
 
     def _ingest_payload(self, payload: IngestPayload) -> bool:
         """Send a single payload to the API for ingestion."""
-        result = self._api_post("/api/ingest", {
-            "text": payload.text,
-            "source": payload.source,
-            "participant_id": payload.participant_id,
-            "domain": payload.domain,
-        })
+        result = self._api_post(
+            "/api/ingest",
+            {
+                "text": payload.text,
+                "source": payload.source,
+                "participant_id": payload.participant_id,
+                "domain": payload.domain,
+            },
+        )
         if result is not None:
             logger.info(
                 "Ingested: domain=%s source=%s (%d chars)",
-                payload.domain, payload.source, len(payload.text),
+                payload.domain,
+                payload.source,
+                len(payload.text),
             )
             return True
         return False
@@ -102,7 +107,9 @@ class InboxProcessor:
             )
             return False  # Leave in inbox for retry
 
-        logger.info("Ingested %d/%d payloads from %s", ingested, len(payloads), path.name)
+        logger.info(
+            "Ingested %d/%d payloads from %s", ingested, len(payloads), path.name
+        )
         self._move_to_processed(path, success=True)
         return True
 
@@ -110,7 +117,8 @@ class InboxProcessor:
         """Process all files currently in the inbox. Returns count processed."""
         extensions = {".md", ".txt", ".json"}
         files = sorted(
-            f for f in self.inbox_dir.iterdir()
+            f
+            for f in self.inbox_dir.iterdir()
             if f.is_file() and f.suffix in extensions
         )
 
@@ -130,9 +138,12 @@ class InboxProcessor:
         count = self.process_all_pending()
         if count > 0:
             logger.info("Triggering dream consolidation...")
-            result = self._api_post("/api/consolidate", {
-                "pairs_per_cycle": pairs_per_cycle,
-            })
+            result = self._api_post(
+                "/api/consolidate",
+                {
+                    "pairs_per_cycle": pairs_per_cycle,
+                },
+            )
             if result is not None:
                 logger.info("Dream cycle: %d new intersections", len(result))
         return count
@@ -143,8 +154,11 @@ class InboxProcessor:
         Returns empty string if no commits have been processed.
         """
         commit_files = sorted(
-            (f for f in self.processed_dir.iterdir()
-             if f.is_file() and "_ok_commit-" in f.name and f.suffix == ".json"),
+            (
+                f
+                for f in self.processed_dir.iterdir()
+                if f.is_file() and "_ok_commit-" in f.name and f.suffix == ".json"
+            ),
             reverse=True,
         )
         if not commit_files:
@@ -159,7 +173,7 @@ class InboxProcessor:
                 parts.append(message)
             if body:
                 parts.append(body)
-            return " -- ".join(parts)
+            return " — ".join(parts)
         except (json.JSONDecodeError, OSError):
             return ""
 
@@ -169,5 +183,4 @@ class InboxProcessor:
         prefix = "ok" if success else "err"
         dest = self.processed_dir / f"{ts}_{prefix}_{path.name}"
         shutil.move(str(path), str(dest))
-        logger.info("Moved %s -> %s", path.name, dest.name)
-
+        logger.info("Moved %s → %s", path.name, dest.name)

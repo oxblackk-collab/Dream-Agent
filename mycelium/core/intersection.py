@@ -175,4 +175,3 @@ class Intersection:
     def should_promote(self, threshold: float = 0.6) -> bool:
         """True if this intersection should become a full CognitiveCell."""
         return self.significance >= threshold and not self.promoted
-

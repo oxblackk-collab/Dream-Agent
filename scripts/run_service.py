@@ -97,7 +97,7 @@ def main() -> None:
 
     # Mount Dream agent endpoints if store is available
     if store is not None:
-        from mycelium.dream.router import create_dream_router
+        from dream.router import create_dream_router
 
         app.include_router(
             create_dream_router(substrate, store), prefix="/api"
@@ -112,7 +112,7 @@ def main() -> None:
         def _get_last_session_context() -> str:
             """Get session context from last processed commit."""
             try:
-                from mycelium.dream.inbox import InboxProcessor
+                from dream.inbox import InboxProcessor
                 proc = InboxProcessor()
                 return proc.last_session_context()
             except Exception:
@@ -135,7 +135,7 @@ def main() -> None:
                     logger.warning("Failed to persist dream_log entry: %s", exc)
             logger.info("Persisted %d dream discoveries to disk", len(discoveries))
 
-            from mycelium.dream.wake import auto_wake
+            from dream.wake import auto_wake
             ctx = _get_last_session_context()
             verified = auto_wake(discoveries, substrate, store, session_context=ctx)
             logger.info("Auto-wake: %d verified from %d discoveries", verified, len(discoveries))

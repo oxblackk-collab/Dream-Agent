@@ -16,7 +16,7 @@ if TYPE_CHECKING:
     from mycelium.core.substrate import Substrate
 
 
-# -- Request/Response schemas ----------------------------------------
+# ── Request/Response schemas ────────────────────────────
 
 
 class IngestRequest(BaseModel):
@@ -81,7 +81,7 @@ class SnapshotResponse(BaseModel):
     dream_log_entries: int
 
 
-# -- Helpers ---------------------------------------------------------
+# ── Helpers ─────────────────────────────────────────────
 
 
 def _cell_to_response(cell: Any) -> CellResponse:
@@ -117,7 +117,7 @@ def _ix_to_response(ix: Any) -> IntersectionResponse:
     )
 
 
-# -- Router factory --------------------------------------------------
+# ── Router factory ──────────────────────────────────────
 
 
 def create_api_router(
@@ -274,4 +274,3 @@ def create_api_router(
         return [_ix_to_response(ix) for ix in ixs]
 
     return router
-

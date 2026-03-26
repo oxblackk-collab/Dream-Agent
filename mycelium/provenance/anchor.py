@@ -7,6 +7,10 @@ produce a different root.
 
 The local anchor is always stored. Blockchain anchoring (writing the
 root to a testnet) is optional and gated behind the 'web3' package.
+
+This maps to The Cognitive Chain's Proof of Provenance: lightweight
+Merkle roots anchored to a public chain, proving the substrate's
+state existed at a given time without storing all data on-chain.
 """
 
 from __future__ import annotations
@@ -80,4 +84,3 @@ class ProvenanceAnchor:
         """Verify a snapshot matches a previously anchored root."""
         current_root = compute_snapshot_merkle(snapshot)
         return current_root == expected_root
-
