@@ -113,4 +113,3 @@ class Dreamer:
                 # Reset idle timer after dreaming
                 with self._lock:
                     self._last_activity_time = time.time()
-

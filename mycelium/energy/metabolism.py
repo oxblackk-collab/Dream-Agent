@@ -12,10 +12,10 @@ Energy Drains:
 - Base decay: continuous tick-based loss (adaptive — stabilises with use)
 
 Thresholds:
-- Archive:   energy below this -> cell excluded from active retrieval
+- Archive:   energy below this → cell excluded from active retrieval
              but preserved and accessible to dream consolidation
-- Vitality:  energy below this -> cell skipped in Recognize
-- Mitosis:   energy above this (+ diversity) -> cell can divide
+- Vitality:  energy below this → cell skipped in Recognize
+- Mitosis:   energy above this (+ diversity) → cell can divide
 
 EF-005 — Cross-domain multiplier (paracrine vs autocrine signals):
 - Cross-domain boost x1.0: full signal (paracrine — from different domain)
@@ -56,7 +56,7 @@ class Metabolism:
     BASE_DECAY_RATE: float = 0.001
     # EF-006: each access_count unit reduces effective decay by this fraction.
     # effective_decay = base_decay / (1 + access_count * STABILIZATION_FACTOR)
-    # At access_count=10 -> 40% of base decay. At 20 -> 25%. Never zero.
+    # At access_count=10 → 40% of base decay. At 20 → 25%. Never zero.
     STABILIZATION_FACTOR: float = 0.15
 
     # Thresholds
@@ -181,8 +181,8 @@ class Metabolism:
     ) -> None:
         """Boost energy when a cell is accessed as a top-k neighbor.
 
-        Cross-domain access (paracrine signal) -> full boost.
-        Same-domain access (autocrine signal)  -> half boost.
+        Cross-domain access (paracrine signal) → full boost.
+        Same-domain access (autocrine signal)  → half boost.
         Context gate: off-context input dampens the boost — the
         substrate doesn't nourish what doesn't fit the trajectory.
         """
@@ -201,8 +201,8 @@ class Metabolism:
     ) -> None:
         """Boost energy when a cell participates in a new intersection.
 
-        Cross-domain intersection -> full boost.
-        Same-domain intersection  -> half boost.
+        Cross-domain intersection → full boost.
+        Same-domain intersection  → half boost.
         Context gate: attentional modulation — only contextually
         coherent interactions fully potentiate.
         EF-006: touch() increments access_count.
@@ -261,4 +261,3 @@ class Metabolism:
     def is_vital(self, cell: CognitiveCell) -> bool:
         """True if cell has enough energy to participate in Recognize."""
         return cell.energy >= self.vitality_minimum
-

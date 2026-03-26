@@ -8,8 +8,8 @@ Usage as library:
     results = inspire("Elliott Waves", k=5)
 
 Usage as CLI:
-    python -m mycelium.api.inspire "Elliott Waves"
-    python -m mycelium.api.inspire "prediction markets" --k 3
+    uv run python -m mycelium.api.inspire "Elliott Waves"
+    uv run python -m mycelium.api.inspire "prediction markets" --k 3
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ from mycelium.core.substrate import Substrate
 from mycelium.embedding.embedder import SentenceTransformerEmbedder
 from mycelium.storage.store import SubstrateStore
 
-MYCELIUM_DB = Path("data/dream_substrate.db")
+MYCELIUM_DB = Path(__file__).parent.parent.parent / "data" / "dream_substrate.db"
 
 
 @dataclass
@@ -190,7 +190,7 @@ def format_for_claude(result: InspireResult) -> str:
         for i, cell in enumerate(result.nearest_cells, 1):
             lines.append(
                 f"{i}. [{cell['domain']}] (dist={cell['distance']}) "
-                f"-- {cell['text'][:150]}..."
+                f"— {cell['text'][:150]}..."
             )
         lines.append("")
 
@@ -198,7 +198,7 @@ def format_for_claude(result: InspireResult) -> str:
         lines.append("### Cross-domain connections (by significance)")
         for i, lat in enumerate(result.lateral_connections, 1):
             lines.append(
-                f"{i}. **{lat.cell_domain}** <-> **{lat.connected_to_domain}** "
+                f"{i}. **{lat.cell_domain}** ↔ **{lat.connected_to_domain}** "
                 f"(sig={lat.intersection_significance}, "
                 f"novelty={lat.intersection_novelty})"
             )
@@ -244,4 +244,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

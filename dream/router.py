@@ -137,7 +137,9 @@ def _inspire_on_substrate(
 ) -> InspireResult:
     """Run inspire logic on an already-loaded substrate instance."""
     raw_results = substrate.search_by_text(
-        query, k=k * 10, active_only=True,
+        query,
+        k=k * 10,
+        active_only=True,
     )
 
     # Prefer cells with domains (originals) for cross-domain search
@@ -150,14 +152,16 @@ def _inspire_on_substrate(
 
     nearest_cells = []
     for cell, distance in results:
-        nearest_cells.append({
-            "text": cell.text[:300] if cell.text else "",
-            "domain": cell.domain,
-            "source": cell.origin.source,
-            "distance": round(distance, 4),
-            "confidence": round(cell.confidence, 3),
-            "energy": round(cell.energy, 3),
-        })
+        nearest_cells.append(
+            {
+                "text": cell.text[:300] if cell.text else "",
+                "domain": cell.domain,
+                "source": cell.origin.source,
+                "distance": round(distance, 4),
+                "confidence": round(cell.confidence, 3),
+                "energy": round(cell.energy, 3),
+            }
+        )
 
     # Find cross-domain connections
     seen_pairs: set[frozenset[CellID]] = set()
@@ -167,11 +171,7 @@ def _inspire_on_substrate(
         intersections = substrate.get_intersections_for(cell.id)
 
         for ix in intersections:
-            other_id = (
-                ix.parent_b_id
-                if ix.parent_a_id == cell.id
-                else ix.parent_a_id
-            )
+            other_id = ix.parent_b_id if ix.parent_a_id == cell.id else ix.parent_a_id
             other = substrate.get_cell(other_id)
             if other is None:
                 continue
@@ -192,9 +192,7 @@ def _inspire_on_substrate(
                 cell_source=cell.origin.source,
                 cell_confidence=round(cell.confidence, 3),
                 cell_energy=round(cell.energy, 3),
-                connected_to_text=(
-                    other.text[:300] if other.text else ""
-                ),
+                connected_to_text=(other.text[:300] if other.text else ""),
                 connected_to_domain=other.domain,
                 connected_to_source=other.origin.source,
                 intersection_significance=round(ix.significance, 4),
@@ -273,19 +271,19 @@ def create_dream_router(
         max_lateral: int = 10,
     ) -> InspireResponse:
         if not q.strip():
-            raise HTTPException(
-                status_code=400, detail="Query cannot be empty"
-            )
+            raise HTTPException(status_code=400, detail="Query cannot be empty")
         result = _inspire_on_substrate(
-            substrate, query=q, k=k, max_lateral=max_lateral,
+            substrate,
+            query=q,
+            k=k,
+            max_lateral=max_lateral,
         )
         formatted = format_for_claude(result)
         return InspireResponse(
             query=result.query,
             nearest_cells=result.nearest_cells,
             lateral_connections=[
-                _lateral_to_response(lat)
-                for lat in result.lateral_connections
+                _lateral_to_response(lat) for lat in result.lateral_connections
             ],
             formatted=formatted,
             total_cells=result.total_cells_in_substrate,
@@ -323,7 +321,9 @@ def create_dream_router(
         wake_verified: bool | None = None,
     ) -> list[DreamEntryResponse]:
         rows = store.get_dream_log(
-            limit=limit, offset=offset, wake_verified=wake_verified,
+            limit=limit,
+            offset=offset,
+            wake_verified=wake_verified,
         )
         return [_dream_row_to_response(r) for r in rows]
 
@@ -334,7 +334,10 @@ def create_dream_router(
 
         # Get lateral connections via inspire logic
         result = _inspire_on_substrate(
-            substrate, req.query, k=req.top_k, max_lateral=req.top_k,
+            substrate,
+            req.query,
+            k=req.top_k,
+            max_lateral=req.top_k,
         )
 
         # Deduplicate: skip domain pairs that already have a verified insight
@@ -356,8 +359,10 @@ def create_dream_router(
             logger.warning("Failed to load verified domain pairs: %s", exc)
 
         connections = [
-            c for c in result.lateral_connections
-            if not c.cell_domain or not c.connected_to_domain
+            c
+            for c in result.lateral_connections
+            if not c.cell_domain
+            or not c.connected_to_domain
             or frozenset({c.cell_domain, c.connected_to_domain}) not in verified_pairs
         ]
 
@@ -372,16 +377,18 @@ def create_dream_router(
             )
 
         # Evaluate via Claude (CLI → API → none) — async to avoid blocking
-        from mycelium.dream.wake import WakeFilter as WF
+        from dream.wake import WakeFilter as WF
 
         wake = WF()
         wake_results, backend = await wake.evaluate_async(
-            req.query, connections, req.session_context,
+            req.query,
+            connections,
+            req.session_context,
         )
 
         # Apply energy effects and record results
-        BOOST_VERIFIED = 0.09   # 3x consolidation boost
-        DECAY_REJECTED = 0.03   # mild penalty
+        BOOST_VERIFIED = 0.09  # 3x consolidation boost
+        DECAY_REJECTED = 0.03  # mild penalty
 
         results: list[WakeConnectionResult] = []
         for i, conn in enumerate(connections):
@@ -437,22 +444,30 @@ def create_dream_router(
                                WHERE (ix.parent_a = ? AND ix.parent_b = ?)
                                   OR (ix.parent_a = ? AND ix.parent_b = ?)
                                ORDER BY dl.id DESC LIMIT 1""",
-                            (conn.cell_id, conn.connected_to_id,
-                             conn.connected_to_id, conn.cell_id),
+                            (
+                                conn.cell_id,
+                                conn.connected_to_id,
+                                conn.connected_to_id,
+                                conn.cell_id,
+                            ),
                         ).fetchone()
                         if row:
                             store.set_wake_verification(
-                                row["id"], verified, reasoning,
+                                row["id"],
+                                verified,
+                                reasoning,
                             )
                 except Exception as exc:
                     logger.warning("Failed to persist wake result: %s", exc)
 
-            results.append(WakeConnectionResult(
-                connection=_lateral_to_response(conn),
-                verified=verified,
-                confidence=confidence,
-                reasoning=reasoning,
-            ))
+            results.append(
+                WakeConnectionResult(
+                    connection=_lateral_to_response(conn),
+                    verified=verified,
+                    confidence=confidence,
+                    reasoning=reasoning,
+                )
+            )
 
         verified_count = sum(1 for r in results if r.verified)
 
@@ -499,20 +514,27 @@ def create_dream_router(
                     continue
                 if not ca.domain or not cb.domain or ca.domain == cb.domain:
                     continue
-                candidates.append((
-                    ix.significance, ix.id,
-                    ca.id, ca.domain, (ca.text or "")[:200],
-                    cb.id, cb.domain, (cb.text or "")[:200],
-                ))
+                candidates.append(
+                    (
+                        ix.significance,
+                        ix.id,
+                        ca.id,
+                        ca.domain,
+                        (ca.text or "")[:200],
+                        cb.id,
+                        cb.domain,
+                        (cb.text or "")[:200],
+                    )
+                )
             candidates.sort(key=lambda x: x[0], reverse=True)
-            candidates = candidates[:limit * 20]
+            candidates = candidates[: limit * 20]
 
             # Step 2: Batch lookup unverified dream_log entries
             ix_ids = [c[1] for c in candidates]
             dl_map: dict[str, tuple[int, str]] = {}
             with store._conn() as db:
                 for batch_start in range(0, len(ix_ids), 100):
-                    batch = ix_ids[batch_start:batch_start + 100]
+                    batch = ix_ids[batch_start : batch_start + 100]
                     placeholders = ",".join("?" * len(batch))
                     dl_rows = db.execute(
                         f"""SELECT intersection_id, MIN(id) AS id,
@@ -525,24 +547,27 @@ def create_dream_router(
                     ).fetchall()
                     for dr in dl_rows:
                         dl_map[dr["intersection_id"]] = (
-                            dr["id"], dr["description"] or "",
+                            dr["id"],
+                            dr["description"] or "",
                         )
             rows = []
             for sig, ix_id, ca_id, da, ta, cb_id, db_domain, tb in candidates:
                 if ix_id in dl_map:
                     dl_id, dl_desc = dl_map[ix_id]
-                    rows.append({
-                        "id": dl_id,
-                        "intersection_id": ix_id,
-                        "significance": sig,
-                        "parent_a": ca_id,
-                        "domain_a": da,
-                        "text_a": ta,
-                        "parent_b": cb_id,
-                        "domain_b": db_domain,
-                        "text_b": tb,
-                        "description": dl_desc,
-                    })
+                    rows.append(
+                        {
+                            "id": dl_id,
+                            "intersection_id": ix_id,
+                            "significance": sig,
+                            "parent_a": ca_id,
+                            "domain_a": da,
+                            "text_a": ta,
+                            "parent_b": cb_id,
+                            "domain_b": db_domain,
+                            "text_b": tb,
+                            "description": dl_desc,
+                        }
+                    )
         except Exception as exc:
             logger.warning("Failed to query wake-pending: %s", exc)
             return []
@@ -556,22 +581,24 @@ def create_dream_router(
             if pair in seen_pairs:
                 continue
             seen_pairs.add(pair)
-            entries.append(WakePendingEntry(
-                id=r["id"],
-                intersection_id=str(r["intersection_id"]),
-                significance=round(r["significance"], 4),
-                cell_a=WakePendingCell(
-                    id=str(r["parent_a"]),
-                    domain=r["domain_a"],
-                    text=(r["text_a"] or "")[:200],
-                ),
-                cell_b=WakePendingCell(
-                    id=str(r["parent_b"]),
-                    domain=r["domain_b"],
-                    text=(r["text_b"] or "")[:200],
-                ),
-                description=r["description"] or "",
-            ))
+            entries.append(
+                WakePendingEntry(
+                    id=r["id"],
+                    intersection_id=str(r["intersection_id"]),
+                    significance=round(r["significance"], 4),
+                    cell_a=WakePendingCell(
+                        id=str(r["parent_a"]),
+                        domain=r["domain_a"],
+                        text=(r["text_a"] or "")[:200],
+                    ),
+                    cell_b=WakePendingCell(
+                        id=str(r["parent_b"]),
+                        domain=r["domain_b"],
+                        text=(r["text_b"] or "")[:200],
+                    ),
+                    description=r["description"] or "",
+                )
+            )
             if len(entries) >= limit:
                 break
 
@@ -589,10 +616,14 @@ def create_dream_router(
         for item in req.results:
             try:
                 store.set_wake_verification(
-                    item.dream_log_id, item.verified, item.reasoning,
+                    item.dream_log_id,
+                    item.verified,
+                    item.reasoning,
                 )
             except Exception as exc:
-                logger.warning("Failed to persist wake result for %d: %s", item.dream_log_id, exc)
+                logger.warning(
+                    "Failed to persist wake result for %d: %s", item.dream_log_id, exc
+                )
                 continue
 
             processed += 1
@@ -620,8 +651,14 @@ def create_dream_router(
                         else:
                             cell.energy = max(0.0, cell.energy - DECAY_REJECTED)
             except Exception as exc:
-                logger.warning("Failed to apply energy effects for %d: %s", item.dream_log_id, exc)
+                logger.warning(
+                    "Failed to apply energy effects for %d: %s", item.dream_log_id, exc
+                )
 
-        return {"processed": processed, "verified": verified_count, "rejected": rejected_count}
+        return {
+            "processed": processed,
+            "verified": verified_count,
+            "rejected": rejected_count,
+        }
 
     return router

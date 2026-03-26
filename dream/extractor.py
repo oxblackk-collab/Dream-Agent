@@ -41,7 +41,7 @@ def detect_content_type(path: Path) -> ContentType:
     # Chat transcript patterns
     chat_patterns = [
         r"^(Human|Assistant|User|Claude)\s*:",
-        r"^\*\*(?:Human|Assistant|User|Claude)\*\*:",
+        r"^\*\*(Human|Assistant|User|Claude|0x\w+)\*\*:",
         r"^<(human|assistant)>",
     ]
     lines = text.split("\n")[:50]  # Check first 50 lines
@@ -144,6 +144,8 @@ def extract_from_chat(text: str, source_file: str = "") -> list[IngestPayload]:
             "problem", "issue", "discovered", "realized", "insight",
             "architecture", "pattern", "design", "why", "important",
             "mistake", "wrong", "correct", "learned", "surprising",
+            "decisión", "elegí", "porque", "tensión", "problema",
+            "descubrí", "aprendí", "importante", "error", "sorprendente",
         ]
         signal_count = sum(1 for w in signal_words if w in content)
         if signal_count >= 2:
@@ -205,7 +207,7 @@ def _split_chat_exchanges(text: str) -> list[str]:
     # Try common patterns
     patterns = [
         r"(?=^(?:Human|User|Assistant|Claude)\s*:)",  # "Human:" style
-        r"(?=^\*\*(?:Human|User|Assistant|Claude)\*\*:)",  # "**Human**:" style
+        r"(?=^\*\*(?:Human|User|Assistant|Claude|0x\w+)\*\*:)",  # "**Human**:" style
         r"(?=^#{1,3}\s)",  # Markdown headers as separators
         r"(?=^---\s*$)",  # Horizontal rules
     ]
@@ -225,4 +227,3 @@ def _split_chat_exchanges(text: str) -> list[str]:
 
     # Fallback: return whole text as single exchange
     return [text]
-
