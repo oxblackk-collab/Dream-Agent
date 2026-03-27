@@ -85,7 +85,7 @@ class InboxProcessor:
         # Extract payloads
         try:
             payloads = extract(path)
-        except Exception as exc:
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError, ValueError) as exc:
             logger.error("Extraction failed for %s: %s", path.name, exc)
             self._move_to_processed(path, success=False)
             return False

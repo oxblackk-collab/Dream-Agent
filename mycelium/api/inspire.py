@@ -15,15 +15,16 @@ Usage as CLI:
 from __future__ import annotations
 
 import json
-import sys
+import logging
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from mycelium.core.cell import CellID, CognitiveCell
-from mycelium.core.intersection import Intersection
+from mycelium.core.cell import CellID
 from mycelium.core.substrate import Substrate
 from mycelium.embedding.embedder import SentenceTransformerEmbedder
 from mycelium.storage.store import SubstrateStore
+
+logger = logging.getLogger(__name__)
 
 MYCELIUM_DB = Path(__file__).parent.parent.parent / "data" / "dream_substrate.db"
 
@@ -71,9 +72,82 @@ def _load_substrate(db_path: Path = MYCELIUM_DB) -> Substrate:
         promotion_threshold=0.55,
         recursion_depth_limit=1,
     )
-    substrate._cells.update(cells)
-    substrate._intersections.update(intersections)
+    substrate.load_state(cells, intersections)
     return substrate
+
+
+def _search_nearest(
+    substrate: Substrate,
+    query: str,
+    k: int,
+) -> list[tuple]:
+    """Search substrate and return top-k results, preferring cells with domains."""
+    raw_results = substrate.search_by_text(query, k=k * 10, active_only=True)
+
+    domain_results = [(c, d) for c, d in raw_results if c.domain]
+    no_domain_results = [(c, d) for c, d in raw_results if not c.domain]
+
+    results = domain_results[:k]
+    if len(results) < k:
+        results.extend(no_domain_results[: k - len(results)])
+    return results
+
+
+def _results_to_dicts(results: list[tuple]) -> list[dict]:
+    """Convert search results to serializable cell dicts."""
+    return [
+        {
+            "text": cell.text[:300] if cell.text else "",
+            "domain": cell.domain,
+            "source": cell.origin.source,
+            "distance": round(distance, 4),
+            "confidence": round(cell.confidence, 3),
+            "energy": round(cell.energy, 3),
+        }
+        for cell, distance in results
+    ]
+
+
+def _find_cross_domain_laterals(
+    substrate: Substrate,
+    results: list[tuple],
+    max_lateral: int,
+) -> list[LateralConnection]:
+    """Discover cross-domain lateral connections from search results."""
+    seen_pairs: set[frozenset[CellID]] = set()
+    all_laterals: list[tuple[float, LateralConnection]] = []
+
+    for cell, _ in results:
+        for ix in substrate.get_intersections_for(cell.id):
+            other_id = ix.parent_b_id if ix.parent_a_id == cell.id else ix.parent_a_id
+            other = substrate.get_cell(other_id)
+            if other is None or not cell.domain or not other.domain:
+                continue
+            if cell.domain == other.domain:
+                continue
+
+            pair = frozenset({cell.id, other.id})
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+
+            lateral = LateralConnection(
+                cell_text=cell.text[:300] if cell.text else "",
+                cell_domain=cell.domain,
+                cell_source=cell.origin.source,
+                cell_confidence=round(cell.confidence, 3),
+                cell_energy=round(cell.energy, 3),
+                connected_to_text=other.text[:300] if other.text else "",
+                connected_to_domain=other.domain,
+                connected_to_source=other.origin.source,
+                intersection_significance=round(ix.significance, 4),
+                intersection_overlap=round(ix.overlap, 4),
+                intersection_novelty=round(ix.novelty, 4),
+            )
+            all_laterals.append((ix.significance, lateral))
+
+    all_laterals.sort(key=lambda t: -t[0])
+    return [lat for _, lat in all_laterals[:max_lateral]]
 
 
 def inspire(
@@ -95,77 +169,9 @@ def inspire(
         db_path: Path to the substrate database
     """
     substrate = _load_substrate(db_path)
-
-    # Find nearest cells — search wider, then separate originals from promoted
-    raw_results = substrate.search_by_text(query, k=k * 10, active_only=True)
-
-    # Prefer cells with domains (originals) for cross-domain search
-    domain_results = [(c, d) for c, d in raw_results if c.domain]
-    no_domain_results = [(c, d) for c, d in raw_results if not c.domain]
-
-    # Take top k with domains, fill rest from promoted if needed
-    results = domain_results[:k]
-    if len(results) < k:
-        results.extend(no_domain_results[:k - len(results)])
-
-    nearest_cells = []
-    for cell, distance in results:
-        nearest_cells.append({
-            "text": cell.text[:300] if cell.text else "",
-            "domain": cell.domain,
-            "source": cell.origin.source,
-            "distance": round(distance, 4),
-            "confidence": round(cell.confidence, 3),
-            "energy": round(cell.energy, 3),
-        })
-
-    # Find cross-domain connections
-    seen_pairs: set[frozenset[CellID]] = set()
-    all_laterals: list[tuple[float, LateralConnection]] = []
-
-    for cell, _ in results:
-        intersections = substrate.get_intersections_for(cell.id)
-
-        for ix in intersections:
-            # Get the other cell
-            other_id = (
-                ix.parent_b_id if ix.parent_a_id == cell.id
-                else ix.parent_a_id
-            )
-            other = substrate.get_cell(other_id)
-            if other is None:
-                continue
-
-            # Only cross-domain connections (both must have domains)
-            if not cell.domain or not other.domain:
-                continue
-            if cell.domain == other.domain:
-                continue
-
-            # Deduplicate
-            pair = frozenset({cell.id, other.id})
-            if pair in seen_pairs:
-                continue
-            seen_pairs.add(pair)
-
-            lateral = LateralConnection(
-                cell_text=cell.text[:300] if cell.text else "",
-                cell_domain=cell.domain,
-                cell_source=cell.origin.source,
-                cell_confidence=round(cell.confidence, 3),
-                cell_energy=round(cell.energy, 3),
-                connected_to_text=other.text[:300] if other.text else "",
-                connected_to_domain=other.domain,
-                connected_to_source=other.origin.source,
-                intersection_significance=round(ix.significance, 4),
-                intersection_overlap=round(ix.overlap, 4),
-                intersection_novelty=round(ix.novelty, 4),
-            )
-            all_laterals.append((ix.significance, lateral))
-
-    # Sort by significance, take top N
-    all_laterals.sort(key=lambda t: -t[0])
-    top_laterals = [lat for _, lat in all_laterals[:max_lateral]]
+    results = _search_nearest(substrate, query, k)
+    nearest_cells = _results_to_dicts(results)
+    top_laterals = _find_cross_domain_laterals(substrate, results, max_lateral)
 
     return InspireResult(
         query=query,
@@ -179,7 +185,7 @@ def inspire(
 def format_for_claude(result: InspireResult) -> str:
     """Format InspireResult as structured text for Claude to interpret."""
     lines = [
-        f"## Mycelium Lateral Connections for: \"{result.query}\"",
+        f'## Mycelium Lateral Connections for: "{result.query}"',
         f"Substrate: {result.total_cells_in_substrate} cells, "
         f"{result.total_intersections_in_substrate} intersections",
         "",
@@ -215,12 +221,16 @@ def main() -> None:
     """CLI entry point."""
     import argparse
 
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+
     parser = argparse.ArgumentParser(
         description="Query Mycelium for lateral connections"
     )
     parser.add_argument("query", type=str, help="Topic or problem to explore")
     parser.add_argument("--k", type=int, default=5, help="Nearest cells (default: 5)")
-    parser.add_argument("--max-lateral", type=int, default=10, help="Max connections (default: 10)")
+    parser.add_argument(
+        "--max-lateral", type=int, default=10, help="Max connections (default: 10)"
+    )
     parser.add_argument("--json", action="store_true", help="Output as JSON")
     parser.add_argument("--db", type=str, default=None, help="DB path override")
     args = parser.parse_args()
@@ -237,9 +247,9 @@ def main() -> None:
             "substrate_cells": result.total_cells_in_substrate,
             "substrate_intersections": result.total_intersections_in_substrate,
         }
-        print(json.dumps(out, indent=2, ensure_ascii=False))
+        logger.info(json.dumps(out, indent=2, ensure_ascii=False))
     else:
-        print(format_for_claude(result))
+        logger.info(format_for_claude(result))
 
 
 if __name__ == "__main__":

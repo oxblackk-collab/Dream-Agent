@@ -18,7 +18,12 @@ import json
 import logging
 import sqlite3
 import sys
+from contextlib import contextmanager
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Generator
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -50,139 +55,86 @@ def save_sync_state(state: dict) -> None:
     SYNC_STATE.write_text(json.dumps(state, indent=2))
 
 
+@contextmanager
+def _engram_connection() -> Generator[sqlite3.Connection, None, None]:
+    """Context manager that properly opens AND closes the engram DB connection."""
+    conn = sqlite3.connect(str(ENGRAM_DB))
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
 def fetch_new_observations(since: str) -> list[dict]:
     """Fetch engram observations newer than `since`."""
     if not ENGRAM_DB.exists():
         logger.warning("Engram DB not found: %s", ENGRAM_DB)
         return []
 
-    conn = sqlite3.connect(str(ENGRAM_DB))
-    conn.row_factory = sqlite3.Row
-    rows = conn.execute(
-        "SELECT id, type, title, content, project, scope, "
-        "created_at FROM observations "
-        "WHERE deleted_at IS NULL AND created_at > ? "
-        "ORDER BY created_at",
-        (since,),
-    ).fetchall()
-    conn.close()
+    with _engram_connection() as conn:
+        rows = conn.execute(
+            "SELECT id, type, title, content, project, scope, "
+            "created_at FROM observations "
+            "WHERE deleted_at IS NULL AND created_at > ? "
+            "ORDER BY created_at",
+            (since,),
+        ).fetchall()
 
     return [dict(r) for r in rows]
 
 
-def run_dream_sync(report_only: bool = False) -> None:
-    print("\n" + "=" * 60)
-    print("MYCELIUM — DREAM SYNC")
-    print("Subconscious processing of engram memories")
-    print("=" * 60)
-
-    # Load sync state
-    state = load_sync_state()
-    last_sync = state["last_sync"]
-    print(f"\n  Last sync: {last_sync}")
-
-    if not report_only:
-        # Fetch new observations from engram
-        new_obs = fetch_new_observations(last_sync)
-        print(f"  New observations: {len(new_obs)}")
-
-        if not new_obs:
-            print("  Nothing new to process.")
-            # Still run dreaming on existing substrate
-        else:
-            # Initialize or load substrate
-            embedder = SentenceTransformerEmbedder()
-            store = SubstrateStore(db_path=MYCELIUM_DB)
-
-            substrate = Substrate(
-                embedder=embedder,
-                initial_radius=0.57,
-                promotion_threshold=0.55,
-                recursion_depth_limit=1,
-                dream_significance_threshold=0.51,
+def _process_observations(
+    observations: list[dict],
+    store: SubstrateStore,
+    substrate: Substrate,
+) -> int:
+    """Ingest observations, run dreaming, and save. Return discovery count."""
+    if MYCELIUM_DB.exists():
+        cells = store.load_cells()
+        intersections = store.load_intersections()
+        if cells:
+            substrate.load_state(cells, intersections)
+            logger.info(
+                "  Loaded existing substrate: %d cells, %d intersections",
+                len(cells),
+                len(intersections),
             )
 
-            # Load existing state if available
-            if MYCELIUM_DB.exists():
-                cells = store.load_cells()
-                intersections = store.load_intersections()
-                if cells:
-                    substrate._cells.update(cells)
-                    substrate._intersections.update(intersections)
-                    print(
-                        f"  Loaded existing substrate:"
-                        f" {len(cells)} cells,"
-                        f" {len(intersections)} intersections"
-                    )
+    logger.info("  Ingesting...")
+    for obs in observations:
+        text = f"{obs['title']}: {obs['content']}"
+        domain = obs.get("project", "general")
+        substrate.ingest(
+            text=text,
+            source=f"engram:{domain}",
+            participant_id="claude",
+            domain=domain,
+        )
+        substrate.tick()
 
-            # Ingest new observations
-            print("\n  Ingesting...")
-            for obs in new_obs:
-                text = f"{obs['title']}: {obs['content']}"
-                domain = obs.get("project", "general")
+    logger.info(
+        "  Substrate now: %d cells, %d intersections",
+        substrate.cell_count,
+        substrate.intersection_count,
+    )
 
-                substrate.ingest(
-                    text=text,
-                    source=f"engram:{domain}",
-                    participant_id="claude",
-                    domain=domain,
-                )
-                substrate.tick()
+    logger.info("  Dreaming...")
+    total_disc = 0
+    for cycle in range(1, 4):
+        disc = substrate.consolidate(pairs_per_cycle=10000)
+        total_disc += len(disc)
+        if disc:
+            logger.info("    Cycle %d: %d discoveries", cycle, len(disc))
 
-            print(
-                f"  Substrate now:"
-                f" {substrate.cell_count} cells,"
-                f" {substrate.intersection_count} intersections"
-            )
+    snap = substrate.get_state_snapshot()
+    store.save_snapshot(snap)
+    return total_disc
 
-            # Dream
-            print("\n  Dreaming...")
-            total_disc = 0
-            for cycle in range(1, 4):
-                disc = substrate.consolidate(
-                    pairs_per_cycle=10000
-                )
-                total_disc += len(disc)
-                if disc:
-                    print(
-                        f"    Cycle {cycle}:"
-                        f" {len(disc)} discoveries"
-                    )
 
-            # Save state
-            snap = substrate.get_state_snapshot()
-            store.save_snapshot(snap)
-
-            # Update sync timestamp
-            latest = max(o["created_at"] for o in new_obs)
-            state["last_sync"] = latest
-            state["total_cells"] = substrate.cell_count
-            state["total_intersections"] = (
-                substrate.intersection_count
-            )
-            state["last_dream_discoveries"] = total_disc
-            save_sync_state(state)
-
-            print(f"\n  Dream discoveries: {total_disc}")
-            print(f"  State saved to: {MYCELIUM_DB}")
-    else:
-        # Report only — load existing substrate
-        store = SubstrateStore(db_path=MYCELIUM_DB)
-        if not MYCELIUM_DB.exists():
-            print("  No substrate found. Run sync first.")
-            return
-
-    # ── REPORT: Cross-domain discoveries ──────────────
-    print("\n" + "=" * 60)
-    print("CROSS-DOMAIN DISCOVERIES")
-    print("Connections the conscious mind didn't make")
-    print("=" * 60)
-
-    store = SubstrateStore(db_path=MYCELIUM_DB)
-    cells = store.load_cells()
-    intersections = store.load_intersections()
-
-    # Find cross-domain pairs between original cells
+def _collect_cross_domain(cells: dict, intersections: dict) -> list[tuple]:
+    """Filter intersections to only cross-domain, non-synthesis discoveries."""
     discoveries = []
     for ix in intersections.values():
         ca = cells.get(ix.parent_a_id)
@@ -198,45 +150,95 @@ def run_dream_sync(report_only: bool = False) -> None:
         if not ca.text or not cb.text:
             continue
         discoveries.append((ix, ca, cb))
+    discoveries.sort(key=lambda t: t[0].significance, reverse=True)
+    return discoveries
 
-    discoveries.sort(
-        key=lambda t: t[0].significance, reverse=True
-    )
+
+def _report_discoveries() -> None:
+    """Load substrate and report cross-domain discoveries."""
+    logger.info("=" * 60)
+    logger.info("CROSS-DOMAIN DISCOVERIES")
+    logger.info("Connections the conscious mind didn't make")
+    logger.info("=" * 60)
+
+    store = SubstrateStore(db_path=MYCELIUM_DB)
+    cells = store.load_cells()
+    intersections = store.load_intersections()
+    discoveries = _collect_cross_domain(cells, intersections)
 
     if not discoveries:
-        print("\n  No cross-domain discoveries yet.")
-        print("  Feed more data and dream again.")
+        logger.info("  No cross-domain discoveries yet.")
+        logger.info("  Feed more data and dream again.")
     else:
         for i, (ix, ca, cb) in enumerate(discoveries[:10], 1):
             title_a = ca.text.split(":")[0] if ":" in ca.text else ca.text[:60]
             title_b = cb.text.split(":")[0] if ":" in cb.text else cb.text[:60]
-            print(
-                f"\n  #{i} [{ca.domain} <-> {cb.domain}]"
-                f" sig={ix.significance:.4f}"
+            logger.info(
+                "  #%d [%s <-> %s] sig=%.4f", i, ca.domain, cb.domain, ix.significance
             )
-            print(f"    A: {title_a}")
-            print(f"    B: {title_b}")
+            logger.info("    A: %s", title_a)
+            logger.info("    B: %s", title_b)
 
-    # Stats
-    active = sum(
-        1 for c in cells.values() if c.state == CellState.ACTIVE
-    )
+    active = sum(1 for c in cells.values() if c.state == CellState.ACTIVE)
     promoted = sum(
-        1
-        for c in cells.values()
-        if c.origin.context == OriginContext.SYNTHESIS
+        1 for c in cells.values() if c.origin.context == OriginContext.SYNTHESIS
     )
-    print(f"\n  Total cells: {len(cells)} (active={active},"
-          f" promoted={promoted})")
-    print(f"  Total intersections: {len(intersections)}")
-    print(f"  Cross-domain discoveries: {len(discoveries)}")
-    print("\n  The substrate dreams.\n")
+    logger.info(
+        "  Total cells: %d (active=%d, promoted=%d)", len(cells), active, promoted
+    )
+    logger.info("  Total intersections: %d", len(intersections))
+    logger.info("  Cross-domain discoveries: %d", len(discoveries))
+    logger.info("  The substrate dreams.")
+
+
+def run_dream_sync(report_only: bool = False) -> None:
+    logger.info("=" * 60)
+    logger.info("MYCELIUM — DREAM SYNC")
+    logger.info("Subconscious processing of engram memories")
+    logger.info("=" * 60)
+
+    state = load_sync_state()
+    last_sync = state["last_sync"]
+    logger.info("  Last sync: %s", last_sync)
+
+    if not report_only:
+        new_obs = fetch_new_observations(last_sync)
+        logger.info("  New observations: %d", len(new_obs))
+
+        if not new_obs:
+            logger.info("  Nothing new to process.")
+        else:
+            embedder = SentenceTransformerEmbedder()
+            store = SubstrateStore(db_path=MYCELIUM_DB)
+            substrate = Substrate(
+                embedder=embedder,
+                initial_radius=0.57,
+                promotion_threshold=0.55,
+                recursion_depth_limit=1,
+                dream_significance_threshold=0.51,
+            )
+
+            total_disc = _process_observations(new_obs, store, substrate)
+
+            latest = max(o["created_at"] for o in new_obs)
+            state["last_sync"] = latest
+            state["total_cells"] = substrate.cell_count
+            state["total_intersections"] = substrate.intersection_count
+            state["last_dream_discoveries"] = total_disc
+            save_sync_state(state)
+
+            logger.info("  Dream discoveries: %d", total_disc)
+            logger.info("  State saved to: %s", MYCELIUM_DB)
+    else:
+        if not MYCELIUM_DB.exists():
+            logger.info("  No substrate found. Run sync first.")
+            return
+
+    _report_discoveries()
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Dream Sync — Mycelium subconscious"
-    )
+    parser = argparse.ArgumentParser(description="Dream Sync — Mycelium subconscious")
     parser.add_argument(
         "--report-only",
         action="store_true",

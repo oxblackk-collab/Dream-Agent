@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -34,7 +35,7 @@ class Dreamer:
         min_idle_seconds: float = 30.0,
         pairs_per_cycle: int = 5000,
         poll_interval_seconds: float = 10.0,
-        on_discoveries: callable | None = None,
+        on_discoveries: Callable[..., None] | None = None,
         # Legacy parameter — ignored, kept for compatibility
         min_idle_ticks: int = 50,
     ) -> None:
@@ -71,7 +72,9 @@ class Dreamer:
         self._thread.start()
         logger.info(
             "Dreamer started (idle_threshold=%.0fs, poll=%.0fs, pairs=%d)",
-            self._min_idle_seconds, self._poll_interval, self._pairs_per_cycle,
+            self._min_idle_seconds,
+            self._poll_interval,
+            self._pairs_per_cycle,
         )
 
     def stop(self) -> None:
@@ -106,8 +109,16 @@ class Dreamer:
                     if self._on_discoveries:
                         try:
                             self._on_discoveries(new_discoveries)
-                        except Exception as exc:
-                            logger.error(
+                        except (
+                            TypeError,
+                            ValueError,
+                            AttributeError,
+                            RuntimeError,
+                            OSError,
+                        ) as exc:
+                            # Common callback failures — catch broadly to
+                            # protect dreamer thread without bare Exception
+                            logger.warning(
                                 "Dreamer on_discoveries callback failed: %s", exc
                             )
                 # Reset idle timer after dreaming
