@@ -137,9 +137,7 @@ class Substrate:
     # Attentional context
     # ──────────────────────────────────────────────
 
-    def _compute_context_gate(
-        self, embedding: EmbeddingVector
-    ) -> float:
+    def _compute_context_gate(self, embedding: EmbeddingVector) -> float:
         """How aligned is this embedding with the substrate's trajectory?
 
         Returns a gate value in [0.1, 1.0]:
@@ -151,9 +149,7 @@ class Substrate:
         if self._context_embedding is None:
             return 1.0
         # Cosine similarity (embeddings are unit vectors)
-        similarity = float(
-            np.dot(embedding, self._context_embedding)
-        )
+        similarity = float(np.dot(embedding, self._context_embedding))
         # Map from [-1, 1] to [0, 1], then apply floor of 0.1
         gate = max(0.1, (similarity + 1.0) / 2.0)
         return gate
@@ -175,13 +171,145 @@ class Substrate:
         # Re-normalize to unit vector
         norm = float(np.linalg.norm(self._context_embedding))
         if norm > 0:
-            self._context_embedding = (
-                self._context_embedding / norm
-            )
+            self._context_embedding = self._context_embedding / norm
 
     # ──────────────────────────────────────────────
     # Core API
     # ──────────────────────────────────────────────
+
+    def _run_primitives(
+        self,
+        cell: CognitiveCell,
+        embedding: EmbeddingVector,
+        identity: ParticipantIdentity | None,
+        context_gate: float,
+    ) -> tuple[list[Intersection], list[CognitiveCell], set[CellID]]:
+        """Execute the Three Primitives on a newly created cell.
+
+        Handles signing, recognize, intersection boosts, context update,
+        and move-toward-new. Must be called under self._lock.
+
+        Returns (intersections, promoted_cells, accessed_neighbor_ids).
+        """
+        # Sign the cell if identity is provided
+        if identity is not None:
+            from mycelium.provenance.hasher import compute_cell_hash
+
+            cell_hash = compute_cell_hash(cell)
+            cell.origin.signature = identity.sign(cell_hash.encode("utf-8"))
+
+        # II: Recognize (selective)
+        intersections = Primitives.recognize(
+            cells=self._cells,
+            intersections=self._intersections,
+            cell=cell,
+            vitality_minimum=_VITALITY_MINIMUM,
+            max_neighbors=self._ingest_neighbors,
+            compared_pairs=self._compared_pairs,
+        )
+
+        accessed = self._apply_intersection_boosts(cell, intersections, context_gate)
+        self._update_context(embedding)
+
+        # III: Move Toward the New
+        promoted = Primitives.move_toward_new(
+            cells=self._cells,
+            intersections=self._intersections,
+            discovered=intersections,
+            origin_context=cell.origin,
+            promotion_threshold=self._promotion_threshold,
+            initial_radius=self._initial_radius,
+            recursion_depth_limit=self._recursion_depth_limit,
+            compared_pairs=self._compared_pairs,
+            max_neighbors=self._ingest_neighbors,
+        )
+        return intersections, promoted, accessed
+
+    @staticmethod
+    def _build_origin(
+        source: str,
+        participant_id: str,
+        identity: ParticipantIdentity | None,
+    ) -> Origin:
+        """Create an Origin for an ingested cell."""
+        pid = identity.participant_id if identity is not None else participant_id
+        pub_key = identity.public_key_bytes if identity is not None else None
+        return Origin(
+            timestamp=datetime.now(tz=UTC),
+            source=source,
+            context=OriginContext.INTERACTION,
+            participant_id=pid,
+            public_key=pub_key,
+        )
+
+    def _mark_ingest_dirty(
+        self,
+        new_cells: list[CognitiveCell],
+        accessed_neighbors: set[CellID],
+        intersections: list[Intersection],
+    ) -> None:
+        """Record which cells/intersections changed during ingest.
+
+        Enables incremental saves: only persist what's new or modified.
+        Must be called under self._lock.
+        """
+        for c in new_cells:
+            self._dirty_cells.add(c.id)
+        for cid in accessed_neighbors:
+            self._dirty_cells.add(cid)
+        for ix in intersections:
+            self._dirty_intersections.add(ix.id)
+            self._dirty_cells.add(ix.parent_a_id)
+            self._dirty_cells.add(ix.parent_b_id)
+
+    def _apply_intersection_boosts(
+        self,
+        cell: CognitiveCell,
+        intersections: list[Intersection],
+        context_gate: float,
+    ) -> set[CellID]:
+        """Apply retrieval and intersection energy boosts, return accessed neighbor IDs.
+
+        Must be called under self._lock.
+        """
+        accessed: set[CellID] = set()
+        for ix in intersections:
+            if ix.parent_a_id != cell.id:
+                accessed.add(ix.parent_a_id)
+            if ix.parent_b_id != cell.id:
+                accessed.add(ix.parent_b_id)
+
+        # Retrieval boost — gated by context alignment
+        for cid in accessed:
+            if cid in self._cells:
+                neighbor = self._cells[cid]
+                self._metabolism.on_retrieval(
+                    neighbor,
+                    cell_domain=neighbor.domain,
+                    source_domain=cell.domain,
+                    context_gate=context_gate,
+                )
+
+        # Intersection boost — also gated by context
+        for ix in intersections:
+            ca = self._cells.get(ix.parent_a_id)
+            cb = self._cells.get(ix.parent_b_id)
+            if ca:
+                self._metabolism.on_intersection(
+                    ca,
+                    cell_domain=ca.domain,
+                    partner_domain=cb.domain if cb else "",
+                    context_gate=context_gate,
+                )
+            if cb:
+                self._metabolism.on_intersection(
+                    cb,
+                    cell_domain=cb.domain,
+                    partner_domain=ca.domain if ca else "",
+                    context_gate=context_gate,
+                )
+
+        return accessed
 
     def ingest(
         self,
@@ -198,33 +326,9 @@ class Substrate:
         authorship. The participant_id is derived from the public key.
         """
         embedding = self._embedder.embed(text)
-
-        # If identity provided, use its public key as participant_id
-        pid = (
-            identity.participant_id
-            if identity is not None
-            else participant_id
-        )
-        pub_key = (
-            identity.public_key_bytes
-            if identity is not None
-            else None
-        )
-
-        origin = Origin(
-            timestamp=datetime.now(tz=UTC),
-            source=source,
-            context=OriginContext.INTERACTION,
-            participant_id=pid,
-            public_key=pub_key,
-        )
+        origin = self._build_origin(source, participant_id, identity)
 
         with self._lock:
-            # Attentional gating: measure how aligned this cell is
-            # with the substrate's current cognitive trajectory.
-            # The gate modulates energy boosts — not existence or
-            # recognition. The cell exists and is recognized fully,
-            # but off-context input doesn't nourish the tissue.
             context_gate = self._compute_context_gate(embedding)
 
             # I: Exist
@@ -237,94 +341,16 @@ class Substrate:
             )
             cell.text = text
 
-            # Sign the cell if identity is provided
-            if identity is not None:
-                from mycelium.provenance.hasher import (
-                    compute_cell_hash,
-                )
-
-                cell_hash = compute_cell_hash(cell)
-                cell.origin.signature = identity.sign(
-                    cell_hash.encode("utf-8")
-                )
-
-            # II: Recognize (selective)
-            intersections = Primitives.recognize(
-                cells=self._cells,
-                intersections=self._intersections,
-                cell=cell,
-                vitality_minimum=_VITALITY_MINIMUM,
-                max_neighbors=self._ingest_neighbors,
-                compared_pairs=self._compared_pairs,
-            )
-
-            # Retrieval boost — gated by context alignment.
-            # Cells accessed by contextually coherent input get full
-            # boost. Cells accessed by off-context input get dampened
-            # boost — the substrate doesn't nourish what doesn't fit.
-            accessed_neighbors: set[CellID] = set()
-            for ix in intersections:
-                if ix.parent_a_id != cell.id:
-                    accessed_neighbors.add(ix.parent_a_id)
-                if ix.parent_b_id != cell.id:
-                    accessed_neighbors.add(ix.parent_b_id)
-            for cid in accessed_neighbors:
-                if cid in self._cells:
-                    neighbor = self._cells[cid]
-                    self._metabolism.on_retrieval(
-                        neighbor,
-                        cell_domain=neighbor.domain,
-                        source_domain=cell.domain,
-                        context_gate=context_gate,
-                    )
-
-            # Intersection boost — also gated by context
-            for ix in intersections:
-                ca = self._cells.get(ix.parent_a_id)
-                cb = self._cells.get(ix.parent_b_id)
-                if ca:
-                    self._metabolism.on_intersection(
-                        ca,
-                        cell_domain=ca.domain,
-                        partner_domain=cb.domain if cb else "",
-                        context_gate=context_gate,
-                    )
-                if cb:
-                    self._metabolism.on_intersection(
-                        cb,
-                        cell_domain=cb.domain,
-                        partner_domain=ca.domain if ca else "",
-                        context_gate=context_gate,
-                    )
-
-            # Update context — the substrate moves toward this cell
-            self._update_context(embedding)
-
-            # III: Move Toward the New
-            promoted = Primitives.move_toward_new(
-                cells=self._cells,
-                intersections=self._intersections,
-                discovered=intersections,
-                origin_context=origin,
-                promotion_threshold=self._promotion_threshold,
-                initial_radius=self._initial_radius,
-                recursion_depth_limit=self._recursion_depth_limit,
-                compared_pairs=self._compared_pairs,
-                max_neighbors=self._ingest_neighbors,
+            # II & III: Recognize + Move Toward the New
+            intersections, promoted, accessed = self._run_primitives(
+                cell,
+                embedding,
+                identity,
+                context_gate,
             )
 
             all_new = [cell, *promoted]
-
-            # Track dirty state for incremental save
-            for c in all_new:
-                self._dirty_cells.add(c.id)
-            for cid in accessed_neighbors:
-                self._dirty_cells.add(cid)
-            for ix in intersections:
-                self._dirty_intersections.add(ix.id)
-                # Parents got energy boost → dirty
-                self._dirty_cells.add(ix.parent_a_id)
-                self._dirty_cells.add(ix.parent_b_id)
+            self._mark_ingest_dirty(all_new, accessed, intersections)
 
             logger.info(
                 "ingest: +%d cells, +%d intersections, +%d promoted",
@@ -364,64 +390,115 @@ class Substrate:
 
             self._tick_count += 1
 
+    def _find_consolidation_candidates(
+        self,
+        pairs_per_cycle: int,
+    ) -> list[tuple[float, CognitiveCell, CognitiveCell]]:
+        """Find candidate cell pairs for consolidation, sorted by distance.
+
+        EF-005: Includes ARCHIVED cells — dreams can rescue them.
+        EF-007: Ascending distance — closest uncompared pairs first.
+        Must be called under self._lock.
+        """
+        candidate_cells = [
+            c
+            for c in self._cells.values()
+            if c.state in (CellState.ACTIVE, CellState.ARCHIVED) and c.energy >= 0
+        ]
+        dream_cells = [
+            c
+            for c in candidate_cells
+            if c.state == CellState.ARCHIVED or c.energy >= _VITALITY_MINIMUM
+        ]
+
+        if len(dream_cells) < 2:
+            return []
+
+        candidates: list[tuple[float, CognitiveCell, CognitiveCell]] = []
+        for i, ca in enumerate(dream_cells):
+            for cb in dream_cells[i + 1 :]:
+                pair = frozenset({ca.id, cb.id})
+                if pair in self._compared_pairs:
+                    continue
+                dist = ca.distance_to(cb)
+                if dist >= (ca.radius + cb.radius):
+                    continue
+                candidates.append((dist, ca, cb))
+
+        candidates.sort(key=lambda t: t[0])
+        return candidates[:pairs_per_cycle]
+
+    def _process_consolidation_discovery(
+        self,
+        ix: Intersection,
+        ca: CognitiveCell,
+        cb: CognitiveCell,
+    ) -> None:
+        """Handle a newly discovered intersection during consolidation.
+
+        Logs the dream entry, handles archived cell rescue (EF-005),
+        and applies energy boosts for significant connections (EF-008).
+        Must be called under self._lock.
+        """
+        self._dirty_intersections.add(ix.id)
+
+        text_a = ca.text or ca.origin.source
+        text_b = cb.text or cb.origin.source
+        desc_a = (text_a[:100] + "...") if len(text_a) > 100 else text_a
+        desc_b = (text_b[:100] + "...") if len(text_b) > 100 else text_b
+        domain_info = ""
+        if ca.domain and cb.domain and ca.domain != cb.domain:
+            domain_info = f" [{ca.domain} ↔ {cb.domain}]"
+        dream_desc = f"{desc_a} ↔ {desc_b}{domain_info} (sig={ix.significance:.3f})"
+
+        entry = DreamEntry(
+            intersection_id=ix.id,
+            discovered_at=datetime.now(tz=UTC),
+            description=dream_desc,
+        )
+        self._dream_log.append(entry)
+        self._dirty_dream_entries.append(entry)
+
+        # EF-005: Handle archived cell rescue
+        for archived, partner in [(ca, cb), (cb, ca)]:
+            if archived.state != CellState.ARCHIVED:
+                continue
+            if (
+                partner.confidence > archived.confidence * 1.2
+                and ix.overlap > 0.6
+                and partner.state == CellState.ACTIVE
+            ):
+                archived.state = CellState.SUPERSEDED
+                self._dirty_cells.add(archived.id)
+                logger.debug(
+                    "consolidate: archived cell %s superseded by %s",
+                    archived.id[:8],
+                    partner.id[:8],
+                )
+            else:
+                self._metabolism.reactivate(archived)
+                self._dirty_cells.add(archived.id)
+                logger.debug(
+                    "consolidate: archived cell %s reactivated by dream",
+                    archived.id[:8],
+                )
+
+        # EF-008: Wake-filter — only boost if significant enough
+        if ix.significance >= self._dream_significance_threshold:
+            self._metabolism.on_consolidation(ca)
+            self._metabolism.on_consolidation(cb)
+            self._dirty_cells.add(ca.id)
+            self._dirty_cells.add(cb.id)
+
     def consolidate(self, pairs_per_cycle: int = 100) -> list[Intersection]:
         """Oneiric consolidation — discover latent connections.
 
-        EF-005: Includes ARCHIVED cells as candidates — dreams can rescue
-        knowledge that has gone quiet. If an archived cell is found relevant,
-        it gets reactivated (ARCHIVED → ACTIVE). If the partner cell semantically
-        dominates it (higher confidence + deep overlap), it becomes SUPERSEDED
-        instead — preserved as history, not erased.
-
         Systematically compare cell pairs that have never been compared,
         prioritizing overlapping pairs by ascending distance (closest first).
-        EF-007: fixed sort order — cross-domain-first caused dream_discoveries=0
-        because non-overlapping pairs dominated the batch.
         Returns newly discovered intersections.
         """
         with self._lock:
-            # EF-005: Include ARCHIVED cells — dreams can rescue them
-            candidate_cells = [
-                c
-                for c in self._cells.values()
-                if c.state in (CellState.ACTIVE, CellState.ARCHIVED)
-                and c.energy >= 0  # archived cells may have energy near 0
-            ]
-            # But require at least vitality_minimum for ACTIVE cells
-            # and any positive energy (or zero) for ARCHIVED candidates
-            dream_cells = [
-                c
-                for c in candidate_cells
-                if c.state == CellState.ARCHIVED or c.energy >= _VITALITY_MINIMUM
-            ]
-
-            if len(dream_cells) < 2:
-                return []
-
-            # Collect candidate pairs (never compared) that still overlap.
-            # Uses the substrate's memory of compared pairs — no reconstruction.
-            # EF-007: prioritize by ASCENDING distance — pairs most likely to
-            # overlap get processed first. The dream is for latent *nearby*
-            # connections that were missed during ingest (max_neighbors=12 only
-            # sees each cell's closest 12 neighbors; the rest never got compared).
-            # Note: distant pairs that don't overlap are NOT added to
-            # _compared_pairs — the substrate only remembers meaningful
-            # comparisons, not exhaustive scans. This keeps memory O(N*k).
-            candidates: list[tuple[float, CognitiveCell, CognitiveCell]] = []
-            for i, ca in enumerate(dream_cells):
-                for cb in dream_cells[i + 1 :]:
-                    pair = frozenset({ca.id, cb.id})
-                    if pair in self._compared_pairs:
-                        continue
-                    dist = ca.distance_to(cb)
-                    # Early-reject: only keep pairs that can overlap
-                    if dist >= (ca.radius + cb.radius):
-                        continue
-                    candidates.append((dist, ca, cb))
-
-            # Sort ascending by distance (closest uncompared pairs first)
-            candidates.sort(key=lambda t: t[0])
-            batch = candidates[:pairs_per_cycle]
+            batch = self._find_consolidation_candidates(pairs_per_cycle)
 
             new_intersections: list[Intersection] = []
             for _, ca, cb in batch:
@@ -433,62 +510,7 @@ class Substrate:
                 self._intersections[ix.id] = ix
                 new_intersections.append(ix)
 
-                self._dirty_intersections.add(ix.id)
-
-                text_a = ca.text or ca.origin.source
-                text_b = cb.text or cb.origin.source
-                desc_a = (text_a[:100] + "...") if len(text_a) > 100 else text_a
-                desc_b = (text_b[:100] + "...") if len(text_b) > 100 else text_b
-                domain_info = ""
-                if ca.domain and cb.domain and ca.domain != cb.domain:
-                    domain_info = f" [{ca.domain} ↔ {cb.domain}]"
-                dream_desc = f"{desc_a} ↔ {desc_b}{domain_info} (sig={ix.significance:.3f})"
-
-                entry = DreamEntry(
-                    intersection_id=ix.id,
-                    discovered_at=datetime.now(tz=UTC),
-                    description=dream_desc,
-                )
-                self._dream_log.append(entry)
-                self._dirty_dream_entries.append(entry)
-
-                # EF-005: Handle archived cell rescue
-                for archived, partner in [(ca, cb), (cb, ca)]:
-                    if archived.state == CellState.ARCHIVED:
-                        # Dominated? partner has significantly higher confidence
-                        # and deep overlap → this knowledge is superseded
-                        if (
-                            partner.confidence > archived.confidence * 1.2
-                            and ix.overlap > 0.6
-                            and partner.state == CellState.ACTIVE
-                        ):
-                            archived.state = CellState.SUPERSEDED
-                            self._dirty_cells.add(archived.id)
-                            logger.debug(
-                                "consolidate: archived cell %s superseded by %s",
-                                archived.id[:8],
-                                partner.id[:8],
-                            )
-                        else:
-                            # Rescued — the dream found it relevant again
-                            self._metabolism.reactivate(archived)
-                            self._dirty_cells.add(archived.id)
-                            logger.debug(
-                                "consolidate: archived cell %s reactivated by dream",
-                                archived.id[:8],
-                            )
-
-                # EF-008: Wake-filter — only boost cells if the dream connection
-                # is significant enough to survive waking scrutiny.
-                # Low-significance intersections are registered (the dream
-                # happened) but produce no energy boost (discarded on waking).
-                # This models how humans discard incoherent dream connections
-                # while retaining genuine insights that hold up to reality.
-                if ix.significance >= self._dream_significance_threshold:
-                    self._metabolism.on_consolidation(ca)
-                    self._metabolism.on_consolidation(cb)
-                    self._dirty_cells.add(ca.id)
-                    self._dirty_cells.add(cb.id)
+                self._process_consolidation_discovery(ix, ca, cb)
 
             logger.info(
                 "consolidate: examined %d pairs, found %d intersections",
@@ -505,9 +527,7 @@ class Substrate:
         even across long temporal gaps — this is when it matters most.
         """
         with self._lock:
-            archived = self._metabolism.apply_bulk_decay(
-                self._cells, n_ticks
-            )
+            archived = self._metabolism.apply_bulk_decay(self._cells, n_ticks)
             self._tick_count += n_ticks
             return archived
 
@@ -529,9 +549,7 @@ class Substrate:
         """
         with self._lock:
             dirty_cells = {
-                cid: self._cells[cid]
-                for cid in self._dirty_cells
-                if cid in self._cells
+                cid: self._cells[cid] for cid in self._dirty_cells if cid in self._cells
             }
             dirty_ix = {
                 iid: self._intersections[iid]
@@ -605,18 +623,69 @@ class Substrate:
         Convenience method: embed + find_neighbors in one call.
         """
         embedding = self._embedder.embed(query)
-        return self.find_neighbors(
-            embedding, k=k, active_only=active_only
-        )
+        return self.find_neighbors(embedding, k=k, active_only=active_only)
 
-    def get_intersections_for(
-        self, cell_id: CellID
-    ) -> list[Intersection]:
+    def get_intersections_for(self, cell_id: CellID) -> list[Intersection]:
         """Return all intersections involving a given cell."""
         with self._lock:
             return [
                 ix
                 for ix in self._intersections.values()
-                if ix.parent_a_id == cell_id
-                or ix.parent_b_id == cell_id
+                if ix.parent_a_id == cell_id or ix.parent_b_id == cell_id
             ]
+
+    def find_cell_by_text_prefix(
+        self,
+        prefix: str,
+        length: int = 100,
+    ) -> CognitiveCell | None:
+        """Find the first cell whose text starts with the given prefix.
+
+        Compares up to `length` characters of each cell's text against
+        the prefix (also truncated to `length`).
+        Returns the cell or None if no match is found.
+        """
+        target = prefix[:length]
+        with self._lock:
+            for cell in self._cells.values():
+                if cell.text and cell.text[:length] == target:
+                    return cell
+        return None
+
+    def load_state(
+        self,
+        cells: dict[CellID, CognitiveCell],
+        intersections: dict[str, Intersection],
+    ) -> None:
+        """Load pre-existing cells and intersections into the substrate."""
+        with self._lock:
+            self._cells.update(cells)
+            self._intersections.update(intersections)
+
+    def get_cross_domain_intersections(
+        self,
+        min_significance: float = 0.0,
+    ) -> list[tuple[Intersection, CognitiveCell, CognitiveCell]]:
+        """Return cross-domain intersections with their parent cells.
+
+        Filters intersections by minimum significance and requires both
+        parent cells to exist, have non-empty domains, and be from
+        different domains.
+
+        Returns list of (intersection, cell_a, cell_b) tuples sorted by
+        significance descending.
+        """
+        results: list[tuple[Intersection, CognitiveCell, CognitiveCell]] = []
+        with self._lock:
+            for ix in self._intersections.values():
+                if ix.significance < min_significance:
+                    continue
+                ca = self._cells.get(ix.parent_a_id)
+                cb = self._cells.get(ix.parent_b_id)
+                if not ca or not cb:
+                    continue
+                if not ca.domain or not cb.domain or ca.domain == cb.domain:
+                    continue
+                results.append((ix, ca, cb))
+        results.sort(key=lambda t: t[0].significance, reverse=True)
+        return results

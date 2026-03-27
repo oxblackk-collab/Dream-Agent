@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shlex
 import subprocess
 import tempfile
 import threading
@@ -33,7 +34,8 @@ def _api_get(api_base: str, endpoint: str) -> list | dict | None:
         url = f"{api_base}{endpoint}"
         with urlopen(url, timeout=10) as resp:
             return json.loads(resp.read())
-    except (URLError, OSError, json.JSONDecodeError):
+    except (URLError, OSError, json.JSONDecodeError) as exc:
+        logger.debug("API GET request failed (%s%s): %s", api_base, endpoint, exc)
         return None
 
 
@@ -45,8 +47,55 @@ def _api_post(api_base: str, endpoint: str, data: dict) -> dict | None:
         req = Request(url, data=body, headers={"Content-Type": "application/json"})
         with urlopen(req, timeout=10) as resp:
             return json.loads(resp.read())
-    except (URLError, OSError, json.JSONDecodeError):
+    except (URLError, OSError, json.JSONDecodeError) as exc:
+        logger.debug("API POST request failed (%s%s): %s", api_base, endpoint, exc)
         return None
+
+
+def _build_insight_prompt(
+    entry: dict,
+    cell_a: dict | None,
+    cell_b: dict | None,
+) -> str:
+    """Build the prompt string for exploring an insight in opencode."""
+    domain_a = cell_a.get("domain", "unknown") if cell_a else "unknown"
+    domain_b = cell_b.get("domain", "unknown") if cell_b else "unknown"
+    text_a = (cell_a.get("text", "")[:200] if cell_a else "").strip()
+    text_b = (cell_b.get("text", "")[:200] if cell_b else "").strip()
+
+    sig = entry.get("significance", 0)
+    reasoning = entry.get("wake_reasoning", "")
+
+    return (
+        f"Dream found a connection between {domain_a} and {domain_b} "
+        f"(significance: {sig:.3f}):\n\n"
+        f"{reasoning}\n\n"
+        f"Cell A ({domain_a}): {text_a}\n"
+        f"Cell B ({domain_b}): {text_b}\n\n"
+        f"Explore this connection — what patterns or applications do you see?"
+    )
+
+
+def _create_opencode_script(prompt: str) -> str:
+    """Create temp files and a launcher script, return the script path."""
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        prefix="dream_insight_",
+        suffix=".txt",
+        delete=False,
+    ) as f:
+        f.write(prompt)
+        prompt_path = f.name
+
+    script_path = prompt_path.replace(".txt", ".sh")
+    with open(script_path, "w") as f:
+        f.write("#!/bin/bash\n")
+        f.write("source ~/.zshrc 2>/dev/null || source ~/.bashrc 2>/dev/null\n")
+        f.write("cd ~\n")
+        f.write(f'exec opencode --prompt "$(cat {shlex.quote(prompt_path)})"\n')
+
+    os.chmod(script_path, 0o755)
+    return script_path
 
 
 class DreamMenubar:
@@ -57,14 +106,19 @@ class DreamMenubar:
     """
 
     def __init__(self, api_base: str = DEFAULT_API) -> None:
-        import rumps
+        try:
+            import rumps
+        except ImportError as exc:
+            raise ImportError(
+                "rumps is required for menubar. Install with: pip install rumps"
+            ) from exc
+        self._rumps = rumps
 
         self.api_base = api_base
         self._unseen_count = 0
         self._unseen_entries: list[dict] = []
         self._notified_ids: set[int] = set()
         self._insight_menu_items: list[rumps.MenuItem] = []
-
         self.app = rumps.App(
             ICON_NORMAL,
             quit_button="Quit Dream",
@@ -139,7 +193,7 @@ class DreamMenubar:
 
     def _update_insights_menu(self) -> None:
         """Update the insights menu with individual clickable items."""
-        import rumps
+        rumps = self._rumps
 
         # Remove old insight menu items
         for item in self._insight_menu_items:
@@ -177,7 +231,7 @@ class DreamMenubar:
 
     def _notify_new_insights(self) -> None:
         """Send macOS notification for NEW insights not yet notified."""
-        import rumps
+        rumps = self._rumps
 
         new_entries = [
             e for e in self._unseen_entries if e.get("id") not in self._notified_ids
@@ -212,57 +266,21 @@ class DreamMenubar:
 
     def _explore_insight(self, entry: dict) -> None:
         """Open a Terminal window with Claude exploring this insight."""
-        # Fetch cell details for parent_a and parent_b
-        parent_a_id = entry.get("parent_a", "")
-        parent_b_id = entry.get("parent_b", "")
+        cell_a = _api_get(self.api_base, f"/api/cells/{entry.get('parent_a', '')}")
+        cell_b = _api_get(self.api_base, f"/api/cells/{entry.get('parent_b', '')}")
 
-        cell_a = _api_get(self.api_base, f"/api/cells/{parent_a_id}")
-        cell_b = _api_get(self.api_base, f"/api/cells/{parent_b_id}")
+        prompt = _build_insight_prompt(entry, cell_a, cell_b)
+        script_path = _create_opencode_script(prompt)
 
-        domain_a = cell_a.get("domain", "unknown") if cell_a else "unknown"
-        domain_b = cell_b.get("domain", "unknown") if cell_b else "unknown"
-        text_a = (cell_a.get("text", "")[:200] if cell_a else "").strip()
-        text_b = (cell_b.get("text", "")[:200] if cell_b else "").strip()
-
-        sig = entry.get("significance", 0)
-        reasoning = entry.get("wake_reasoning", "")
-
-        prompt = (
-            f"Dream found a connection between {domain_a} and {domain_b} "
-            f"(significance: {sig:.3f}):\n\n"
-            f"{reasoning}\n\n"
-            f"Cell A ({domain_a}): {text_a}\n"
-            f"Cell B ({domain_b}): {text_b}\n\n"
-            f"Explore this connection — what patterns or applications do you see?"
-        )
-
-        # Create launcher script that opens opencode with the insight prompt
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            prefix="dream_insight_",
-            suffix=".txt",
-            delete=False,
-        ) as f:
-            f.write(prompt)
-            prompt_path = f.name
-
-        # Create bash script to launch opencode with the insight via --prompt flag
-        script_path = prompt_path.replace(".txt", ".sh")
-        with open(script_path, "w") as f:
-            f.write("#!/bin/bash\n")
-            f.write("source ~/.zshrc 2>/dev/null || source ~/.bashrc 2>/dev/null\n")
-            f.write("cd ~\n")
-            f.write(f'exec opencode --prompt "$(cat "{prompt_path}")"\n')
-
-        os.chmod(script_path, 0o755)
-
-        # Launch using 'open -a Ghostty' (same as manual test that worked)
         try:
-            logger.info(f"Launching ghostty with opencode")
-            subprocess.Popen(["open", "-a", "Ghostty", script_path])
+            logger.info("Launching ghostty with opencode")
+            # Fire-and-forget — OS manages the child process lifecycle
+            subprocess.Popen(
+                ["open", "-a", "Ghostty", script_path],
+            )
             logger.info("Ghostty launched")
-        except Exception as e:
-            logger.error(f"Failed to launch ghostty: {e}")
+        except (OSError, FileNotFoundError) as e:
+            logger.error("Failed to launch ghostty: %s", e)
 
     def _on_mark_seen(self, _sender) -> None:
         """Mark all unseen dreams as seen."""
@@ -283,9 +301,7 @@ class DreamMenubar:
             self._insight_menu_items.clear()
             self._insights_header.title = "No verified insights"
 
-            import rumps
-
-            rumps.notification("Dream", f"Marked {marked} as seen", "")
+            self._rumps.notification("Dream", f"Marked {marked} as seen", "")
 
     def _on_refresh(self, _sender) -> None:
         """Manually trigger a poll."""

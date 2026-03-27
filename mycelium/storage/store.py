@@ -1,8 +1,8 @@
 """Store — SQLite persistence layer for the Mycelium substrate.
 
-Phase 1: SQLite + pickle for embeddings.
-         In-memory nearest-neighbor queries with numpy.
-         Migration path: replace with pgvector when corpus > 100k cells.
+Embeddings stored as raw float32 bytes via numpy tobytes/frombuffer.
+In-memory nearest-neighbor queries with numpy.
+Migration path: replace with pgvector when corpus > 100k cells.
 
 Schema:
   cells: all CognitiveCells (embeddings as BLOB)
@@ -14,7 +14,6 @@ Schema:
 from __future__ import annotations
 
 import logging
-import pickle
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime
@@ -87,7 +86,6 @@ CREATE TABLE IF NOT EXISTS dream_log (
     description     TEXT NOT NULL DEFAULT ''
 );
 
-CREATE INDEX IF NOT EXISTS idx_dream_log_wake_verified ON dream_log(wake_verified);
 CREATE INDEX IF NOT EXISTS idx_dream_log_intersection_id ON dream_log(intersection_id);
 
 CREATE TABLE IF NOT EXISTS signatures (
@@ -126,7 +124,7 @@ class SubstrateStore:
         try:
             yield conn
             conn.commit()
-        except Exception:
+        except BaseException:
             conn.rollback()
             raise
         finally:
@@ -146,6 +144,12 @@ class SubstrateStore:
                 except sqlite3.OperationalError:
                     pass  # Column already exists
 
+            # Index on wake_verified — must be created AFTER the ALTER TABLE migration
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_dream_log_wake_verified"
+                " ON dream_log(wake_verified)"
+            )
+
     # ──────────────────────────────────────────────
     # Cell persistence
     # ──────────────────────────────────────────────
@@ -158,7 +162,7 @@ class SubstrateStore:
                    (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     cell.id,
-                    pickle.dumps(cell.embedding),
+                    cell.embedding.astype(np.float32).tobytes(),
                     cell.radius,
                     cell.confidence,
                     cell.energy,
@@ -194,58 +198,53 @@ class SubstrateStore:
                     ),
                 )
 
+    @staticmethod
+    def _deserialize_cell_row(
+        row: dict,
+        sigs: dict[str, tuple[bytes, bytes]],
+    ) -> CognitiveCell:
+        """Deserialize a single cell row into a CognitiveCell."""
+        embedding = np.frombuffer(row["embedding"], dtype=np.float32).copy()
+        parent_ids = [CellID(p) for p in row["parent_ids"].split(",") if p]
+        sig_data = sigs.get(row["id"])
+        return CognitiveCell(
+            id=CellID(row["id"]),
+            embedding=embedding.astype(np.float32),
+            radius=row["radius"],
+            confidence=row["confidence"],
+            energy=row["energy"],
+            state=CellState(row["state"]),
+            origin=Origin(
+                timestamp=datetime.fromisoformat(row["origin_ts"]),
+                source=row["origin_src"],
+                context=OriginContext(row["origin_ctx"]),
+                participant_id=row["participant"],
+                signature=sig_data[0] if sig_data else None,
+                public_key=sig_data[1] if sig_data else None,
+            ),
+            created_at=datetime.fromisoformat(row["created_at"]),
+            last_accessed=datetime.fromisoformat(row["last_access"]),
+            access_count=row["access_cnt"],
+            parent_ids=parent_ids,
+            generation=row["generation"],
+            domain=row.get("domain", ""),
+            text=row.get("text", ""),
+        )
+
     def load_cells(self) -> dict[CellID, CognitiveCell]:
         """Load all cells from storage, including signatures."""
-        cells: dict[CellID, CognitiveCell] = {}
-
-        # Load signatures index
         sigs: dict[str, tuple[bytes, bytes]] = {}
         with self._conn() as conn:
             rows = conn.execute("SELECT * FROM cells").fetchall()
             sig_rows = conn.execute(
-                "SELECT cell_id, signature, public_key "
-                "FROM signatures"
+                "SELECT cell_id, signature, public_key FROM signatures"
             ).fetchall()
         for sr in sig_rows:
-            sigs[sr["cell_id"]] = (
-                sr["signature"],
-                sr["public_key"],
-            )
+            sigs[sr["cell_id"]] = (sr["signature"], sr["public_key"])
 
+        cells: dict[CellID, CognitiveCell] = {}
         for row in rows:
-            r = dict(row)
-            embedding: np.ndarray = pickle.loads(r["embedding"])
-            parent_ids = [
-                CellID(p) for p in r["parent_ids"].split(",") if p
-            ]
-            sig_data = sigs.get(r["id"])
-            cell = CognitiveCell(
-                id=CellID(r["id"]),
-                embedding=embedding.astype(np.float32),
-                radius=r["radius"],
-                confidence=r["confidence"],
-                energy=r["energy"],
-                state=CellState(r["state"]),
-                origin=Origin(
-                    timestamp=datetime.fromisoformat(
-                        r["origin_ts"]
-                    ),
-                    source=r["origin_src"],
-                    context=OriginContext(r["origin_ctx"]),
-                    participant_id=r["participant"],
-                    signature=sig_data[0] if sig_data else None,
-                    public_key=sig_data[1] if sig_data else None,
-                ),
-                created_at=datetime.fromisoformat(r["created_at"]),
-                last_accessed=datetime.fromisoformat(
-                    r["last_access"]
-                ),
-                access_count=r["access_cnt"],
-                parent_ids=parent_ids,
-                generation=r["generation"],
-                domain=r.get("domain", ""),
-                text=r.get("text", ""),
-            )
+            cell = self._deserialize_cell_row(dict(row), sigs)
             cells[cell.id] = cell
         return cells
 
@@ -262,7 +261,7 @@ class SubstrateStore:
                     ix.id,
                     ix.parent_a_id,
                     ix.parent_b_id,
-                    pickle.dumps(ix.embedding),
+                    ix.embedding.astype(np.float32).tobytes(),
                     ix.overlap,
                     ix.novelty,
                     ix.significance,
@@ -277,7 +276,7 @@ class SubstrateStore:
         with self._conn() as conn:
             rows = conn.execute("SELECT * FROM intersections").fetchall()
         for row in rows:
-            embedding: np.ndarray = pickle.loads(row["embedding"])
+            embedding = np.frombuffer(row["embedding"], dtype=np.float32).copy()
             ix = Intersection(
                 id=IntersectionID(row["id"]),
                 parent_a_id=CellID(row["parent_a"]),
@@ -296,21 +295,21 @@ class SubstrateStore:
     # Snapshot
     # ──────────────────────────────────────────────
 
-    def save_snapshot(self, snapshot: SubstrateSnapshot) -> None:
-        """Record a substrate state snapshot.
+    @staticmethod
+    def _serialize_cells(
+        cells: dict,
+    ) -> tuple[list[tuple], list[tuple]]:
+        """Serialize cells into row tuples for batch insert.
 
-        Uses batch executemany for cells and intersections — much faster
-        than individual save_cell/save_intersection calls (single transaction,
-        single connection, no per-row overhead).
+        Returns (cell_rows, signature_rows).
         """
-        with self._conn() as conn:
-            # Batch upsert cells
-            cell_rows = []
-            sig_rows = []
-            for cell in snapshot.cells.values():
-                cell_rows.append((
+        cell_rows: list[tuple] = []
+        sig_rows: list[tuple] = []
+        for cell in cells.values():
+            cell_rows.append(
+                (
                     cell.id,
-                    pickle.dumps(cell.embedding),
+                    cell.embedding.astype(np.float32).tobytes(),
                     cell.radius,
                     cell.confidence,
                     cell.energy,
@@ -326,80 +325,111 @@ class SubstrateStore:
                     cell.generation,
                     cell.domain,
                     cell.text,
-                ))
-                if cell.origin.signature and cell.origin.public_key:
-                    from mycelium.provenance.hasher import (
-                        compute_cell_hash,
-                    )
-                    sig_rows.append((
+                )
+            )
+            if cell.origin.signature and cell.origin.public_key:
+                from mycelium.provenance.hasher import compute_cell_hash
+
+                sig_rows.append(
+                    (
                         cell.id,
                         compute_cell_hash(cell),
                         cell.origin.signature,
                         cell.origin.public_key,
                         cell.created_at.isoformat(),
-                    ))
+                    )
+                )
+        return cell_rows, sig_rows
 
-            conn.executemany(
-                "INSERT OR REPLACE INTO cells VALUES"
-                " (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                cell_rows,
+    @staticmethod
+    def _serialize_intersections(
+        intersections: dict,
+    ) -> list[tuple]:
+        """Serialize intersections into row tuples for batch insert."""
+        return [
+            (
+                ix.id,
+                ix.parent_a_id,
+                ix.parent_b_id,
+                ix.embedding.astype(np.float32).tobytes(),
+                ix.overlap,
+                ix.novelty,
+                ix.significance,
+                ix.discovered_at.isoformat(),
+                int(ix.promoted),
             )
-            if sig_rows:
-                conn.executemany(
-                    "INSERT OR REPLACE INTO signatures VALUES"
-                    " (?,?,?,?,?)",
-                    sig_rows,
-                )
+            for ix in intersections.values()
+        ]
 
-            # Batch upsert intersections
-            ix_rows = [
-                (
-                    ix.id,
-                    ix.parent_a_id,
-                    ix.parent_b_id,
-                    pickle.dumps(ix.embedding),
-                    ix.overlap,
-                    ix.novelty,
-                    ix.significance,
-                    ix.discovered_at.isoformat(),
-                    int(ix.promoted),
-                )
-                for ix in snapshot.intersections.values()
-            ]
+    @staticmethod
+    def _write_snapshot_tables(
+        conn: sqlite3.Connection,
+        snapshot: SubstrateSnapshot,
+        cell_rows: list[tuple],
+        sig_rows: list[tuple],
+        ix_rows: list[tuple],
+    ) -> None:
+        """Batch-write all snapshot data into the open connection.
+
+        Inserts/replaces cells, signatures, intersections, the snapshot
+        metadata row, and any dream_log entries.
+        """
+        conn.executemany(
+            "INSERT OR REPLACE INTO cells VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            cell_rows,
+        )
+        if sig_rows:
             conn.executemany(
-                "INSERT OR REPLACE INTO intersections VALUES"
-                " (?,?,?,?,?,?,?,?,?)",
+                "INSERT OR REPLACE INTO signatures VALUES (?,?,?,?,?)",
+                sig_rows,
+            )
+        conn.executemany(
+            "INSERT OR REPLACE INTO intersections VALUES (?,?,?,?,?,?,?,?,?)",
+            ix_rows,
+        )
+        conn.execute(
+            "INSERT INTO snapshots"
+            " (tick_count, cell_count, ix_count, snapshot_at)"
+            " VALUES (?,?,?,?)",
+            (
+                snapshot.tick_count,
+                len(snapshot.cells),
+                len(snapshot.intersections),
+                snapshot.snapshot_at.isoformat(),
+            ),
+        )
+        if snapshot.dream_log:
+            conn.executemany(
+                "INSERT OR IGNORE INTO dream_log"
+                " (intersection_id, discovered_at, description)"
+                " VALUES (?,?,?)",
+                [
+                    (
+                        entry.intersection_id,
+                        entry.discovered_at.isoformat(),
+                        entry.description,
+                    )
+                    for entry in snapshot.dream_log
+                ],
+            )
+
+    def save_snapshot(self, snapshot: SubstrateSnapshot) -> None:
+        """Record a substrate state snapshot.
+
+        Uses batch executemany for cells and intersections — much faster
+        than individual save_cell/save_intersection calls.
+        """
+        cell_rows, sig_rows = self._serialize_cells(snapshot.cells)
+        ix_rows = self._serialize_intersections(snapshot.intersections)
+
+        with self._conn() as conn:
+            self._write_snapshot_tables(
+                conn,
+                snapshot,
+                cell_rows,
+                sig_rows,
                 ix_rows,
             )
-
-            # Snapshot metadata
-            conn.execute(
-                "INSERT INTO snapshots"
-                " (tick_count, cell_count, ix_count, snapshot_at)"
-                " VALUES (?,?,?,?)",
-                (
-                    snapshot.tick_count,
-                    len(snapshot.cells),
-                    len(snapshot.intersections),
-                    snapshot.snapshot_at.isoformat(),
-                ),
-            )
-
-            # Batch dream log
-            if snapshot.dream_log:
-                conn.executemany(
-                    "INSERT OR IGNORE INTO dream_log"
-                    " (intersection_id, discovered_at, description)"
-                    " VALUES (?,?,?)",
-                    [
-                        (
-                            entry.intersection_id,
-                            entry.discovered_at.isoformat(),
-                            entry.description,
-                        )
-                        for entry in snapshot.dream_log
-                    ],
-                )
         logger.info(
             "Snapshot saved: tick=%d, cells=%d, intersections=%d",
             snapshot.tick_count,
@@ -411,8 +441,28 @@ class SubstrateStore:
     # Dream log queries (Dream agent)
     # ──────────────────────────────────────────────
 
+    def save_dream_log_entry(
+        self,
+        intersection_id: str,
+        discovered_at: str,
+        description: str = "",
+    ) -> None:
+        """Persist a dream_log entry.
+
+        Inserts OR IGNOREs into dream_log — safe for duplicate calls.
+        """
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO dream_log"
+                " (intersection_id, discovered_at, description)"
+                " VALUES (?,?,?)",
+                (intersection_id, discovered_at, description),
+            )
+
     def get_unseen_dreams(
-        self, min_significance: float = 0.0, limit: int = 50,
+        self,
+        min_significance: float = 0.0,
+        limit: int = 50,
         verified_only: bool = False,
     ) -> list[dict]:
         """Return dream_log entries that haven't been seen yet.
@@ -455,7 +505,10 @@ class SubstrateStore:
             return cursor.rowcount
 
     def set_wake_verification(
-        self, dream_id: int, verified: bool, reasoning: str = "",
+        self,
+        dream_id: int,
+        verified: bool,
+        reasoning: str = "",
     ) -> None:
         """Record wake filter verification result for a dream entry."""
         with self._conn() as conn:
@@ -490,6 +543,99 @@ class SubstrateStore:
         return [dict(r) for r in rows]
 
     # ──────────────────────────────────────────────
+    # Wake verification queries (Dream agent)
+    # ──────────────────────────────────────────────
+
+    def get_verified_domain_pairs(self) -> set[frozenset[str]]:
+        """Return domain pairs that already have a wake-verified insight.
+
+        Used for deduplication — skip domain pairs that have already been
+        verified so the wake filter focuses on genuinely new connections.
+        """
+        with self._conn() as conn:
+            rows = conn.execute(
+                """SELECT DISTINCT c1.domain, c2.domain
+                   FROM dream_log dl
+                   JOIN intersections ix ON dl.intersection_id = ix.id
+                   JOIN cells c1 ON ix.parent_a = c1.id
+                   JOIN cells c2 ON ix.parent_b = c2.id
+                   WHERE dl.wake_verified = 1
+                   AND c1.domain != '' AND c2.domain != ''""",
+            ).fetchall()
+        return {frozenset({r[0], r[1]}) for r in rows}
+
+    def find_dream_log_by_parents(
+        self,
+        cell_id_a: str,
+        cell_id_b: str,
+    ) -> int | None:
+        """Find the most recent dream_log entry matching parent cell IDs.
+
+        Checks both orderings (a,b) and (b,a). Returns the dream_log id
+        or None if no matching entry exists.
+        """
+        with self._conn() as conn:
+            row = conn.execute(
+                """SELECT dl.id FROM dream_log dl
+                   JOIN intersections ix ON dl.intersection_id = ix.id
+                   WHERE (ix.parent_a = ? AND ix.parent_b = ?)
+                      OR (ix.parent_a = ? AND ix.parent_b = ?)
+                   ORDER BY dl.id DESC LIMIT 1""",
+                (cell_id_a, cell_id_b, cell_id_b, cell_id_a),
+            ).fetchone()
+        return row["id"] if row else None
+
+    def get_unverified_dream_entries_by_intersection(
+        self,
+        intersection_ids: list[str],
+    ) -> dict[str, tuple[int, str]]:
+        """Batch lookup unverified dream_log entries by intersection IDs.
+
+        Returns a dict mapping intersection_id -> (dream_log_id, description)
+        for entries where wake_verified IS NULL.
+        """
+        result: dict[str, tuple[int, str]] = {}
+        with self._conn() as conn:
+            for batch_start in range(0, len(intersection_ids), 100):
+                batch = intersection_ids[batch_start : batch_start + 100]
+                placeholders = ",".join("?" * len(batch))
+                rows = conn.execute(
+                    f"""SELECT intersection_id, MIN(id) AS id,
+                               MIN(description) AS description
+                        FROM dream_log
+                        WHERE intersection_id IN ({placeholders})
+                          AND wake_verified IS NULL
+                        GROUP BY intersection_id""",
+                    batch,
+                ).fetchall()
+                for dr in rows:
+                    result[dr["intersection_id"]] = (
+                        dr["id"],
+                        dr["description"] or "",
+                    )
+        return result
+
+    def get_parent_ids_for_dream(
+        self,
+        dream_log_id: int,
+    ) -> tuple[str, str] | None:
+        """Get parent cell IDs (parent_a, parent_b) for a dream_log entry.
+
+        Returns a tuple (parent_a, parent_b) or None if not found.
+        """
+        with self._conn() as conn:
+            row = conn.execute(
+                """SELECT ix.parent_a, ix.parent_b
+                   FROM dream_log dl
+                   JOIN intersections ix ON dl.intersection_id = ix.id
+                   WHERE dl.id = ?""",
+                (dream_log_id,),
+            ).fetchone()
+        if row:
+            return (row["parent_a"], row["parent_b"])
+        return None
+
+    # ──────────────────────────────────────────────
     # Merkle anchor persistence
     # ──────────────────────────────────────────────
 
@@ -514,17 +660,14 @@ class SubstrateStore:
 
         with self._conn() as conn:
             rows = conn.execute(
-                "SELECT * FROM merkle_anchors "
-                "ORDER BY anchored_at DESC"
+                "SELECT * FROM merkle_anchors ORDER BY anchored_at DESC"
             ).fetchall()
 
         return [
             AnchorRecord(
                 merkle_root=row["merkle_root"],
                 cell_count=row["cell_count"],
-                anchored_at=datetime.fromisoformat(
-                    row["anchored_at"]
-                ),
+                anchored_at=datetime.fromisoformat(row["anchored_at"]),
                 tx_hash=row["tx_hash"],
             )
             for row in rows

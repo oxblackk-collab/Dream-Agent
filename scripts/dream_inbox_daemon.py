@@ -42,7 +42,7 @@ def run_watchdog(processor: InboxProcessor) -> None:
 
     class InboxHandler(FileSystemEventHandler):
         def __init__(self) -> None:
-            self._debounce: dict[str, float] = {}
+            self.debounce: dict[str, float] = {}
 
         def on_created(self, event):
             if event.is_directory:
@@ -51,7 +51,7 @@ def run_watchdog(processor: InboxProcessor) -> None:
             if path.suffix not in {".md", ".txt", ".json"}:
                 return
             # Debounce: wait 1s for file to finish writing
-            self._debounce[str(path)] = time.time()
+            self.debounce[str(path)] = time.time()
 
         def on_modified(self, event):
             self.on_created(event)
@@ -71,12 +71,9 @@ def run_watchdog(processor: InboxProcessor) -> None:
             time.sleep(1)
             # Process debounced files
             now = time.time()
-            ready = [
-                p for p, t in handler._debounce.items()
-                if now - t >= 1.0
-            ]
+            ready = [p for p, t in handler.debounce.items() if now - t >= 1.0]
             for p in ready:
-                del handler._debounce[p]
+                del handler.debounce[p]
                 path = Path(p)
                 if path.exists():
                     processor.process_file(path)
@@ -102,25 +99,29 @@ def run_polling(processor: InboxProcessor, interval: int) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Dream Inbox Daemon")
     parser.add_argument(
-        "--api", type=str, default="http://localhost:8000",
+        "--api",
+        type=str,
+        default="http://localhost:8000",
         help="Mycelium API base URL",
     )
     parser.add_argument(
-        "--poll", type=int, default=0,
+        "--poll",
+        type=int,
+        default=0,
         help="Polling interval in seconds (0 = use watchdog)",
     )
     args = parser.parse_args()
 
     processor = InboxProcessor(api_base=args.api)
 
-    print("\n" + "=" * 50)
-    print("DREAM INBOX DAEMON")
-    print("=" * 50)
-    print(f"  Inbox:     {processor.inbox_dir}")
-    print(f"  Processed: {processor.processed_dir}")
-    print(f"  API:       {args.api}")
-    print(f"  Mode:      {'polling' if args.poll else 'watchdog'}")
-    print("=" * 50 + "\n")
+    logger.info("=" * 50)
+    logger.info("DREAM INBOX DAEMON")
+    logger.info("=" * 50)
+    logger.info("  Inbox:     %s", processor.inbox_dir)
+    logger.info("  Processed: %s", processor.processed_dir)
+    logger.info("  API:       %s", args.api)
+    logger.info("  Mode:      %s", "polling" if args.poll else "watchdog")
+    logger.info("=" * 50)
 
     if args.poll > 0:
         run_polling(processor, args.poll)

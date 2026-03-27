@@ -15,11 +15,16 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import re
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 from urllib.error import URLError
 from urllib.request import Request, urlopen
+
+if TYPE_CHECKING:
+    from mycelium.embedding.embedder import SentenceTransformerEmbedder
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -83,12 +88,14 @@ def parse_export(path: Path) -> list[dict]:
             if sender and text.strip():
                 messages.append({"sender": sender, "text": text.strip()})
 
-        conversations.append({
-            "uuid": conv.get("uuid", "unknown"),
-            "name": conv.get("name", "Untitled"),
-            "created_at": conv.get("created_at", ""),
-            "messages": messages,
-        })
+        conversations.append(
+            {
+                "uuid": conv.get("uuid", "unknown"),
+                "name": conv.get("name", "Untitled"),
+                "created_at": conv.get("created_at", ""),
+                "messages": messages,
+            }
+        )
 
     return conversations
 
@@ -104,7 +111,7 @@ def filter_by_length(conv: dict, min_turns: int) -> bool:
 
 def filter_by_semantic_distance(
     conv: dict,
-    embedder,
+    embedder: SentenceTransformerEmbedder,
     min_distance: float,
 ) -> tuple[bool, float]:
     """Filter 2: semantic distance between first and last assistant message.
@@ -125,71 +132,107 @@ def filter_by_semantic_distance(
     return distance > min_distance, round(distance, 4)
 
 
-def filter_by_patterns(conv: dict) -> tuple[bool, list[str]]:
-    """Filter 3: cognitive patterns in assistant messages.
-
-    Returns (passes, list_of_patterns_found).
-    """
-    assistant_texts = [m["text"] for m in conv["messages"] if m["sender"] == "assistant"]
-    full_text = "\n".join(assistant_texts).lower()
-
-    patterns_found = []
-
-    # Pattern 1: Question without direct answer (assistant ends with ?)
+def _detect_unanswered_question(assistant_texts: list[str]) -> bool:
+    """Detect if assistant ends with a genuine open question."""
     for msg in assistant_texts:
         stripped = msg.strip()
         if stripped.endswith("?"):
-            # Check it's not just a rhetorical question followed by an answer
-            lines = stripped.split("\n")
-            last_line = lines[-1].strip()
+            last_line = stripped.split("\n")[-1].strip()
             if last_line.endswith("?") and len(last_line) > 20:
-                patterns_found.append("pregunta_sin_respuesta")
-                break
+                return True
+    return False
 
-    # Pattern 2: Direction change
-    direction_patterns = [
-        r"\bactually\b", r"\bwait\b", r"\ben realidad\b",
-        r"\bpensándolo mejor\b", r"\bpensandolo mejor\b",
-        r"\bno,? mirá\b", r"\bno,? mira\b",
-        r"\blet me reconsider\b", r"\bahora que lo pienso\b",
-        r"\bi was wrong\b", r"\bme equivoqué\b",
-        r"\bcorrection\b", r"\bcorrección\b",
+
+def _detect_direction_change(full_text: str) -> bool:
+    """Detect direction-change patterns in assistant text."""
+    patterns = [
+        r"\bactually\b",
+        r"\bwait\b",
+        r"\ben realidad\b",
+        r"\bpensándolo mejor\b",
+        r"\bpensandolo mejor\b",
+        r"\bno,? mirá\b",
+        r"\bno,? mira\b",
+        r"\blet me reconsider\b",
+        r"\bahora que lo pienso\b",
+        r"\bi was wrong\b",
+        r"\bme equivoqué\b",
+        r"\bcorrection\b",
+        r"\bcorrección\b",
     ]
-    for pat in direction_patterns:
-        if re.search(pat, full_text):
-            patterns_found.append("cambio_de_direccion")
-            break
+    return any(re.search(pat, full_text) for pat in patterns)
 
-    # Pattern 3: Uncertainty recognition
-    uncertainty_patterns = [
-        r"\bi'?m not sure\b", r"\bno estoy segur[oa]\b",
-        r"\bi don'?t know\b", r"\bno sé\b", r"\bno se\b",
-        r"\bmight be wrong\b", r"\bpodría estar equivocad\b",
-        r"\bhonestly[,.]? i\b", r"\bla verdad es que no\b",
-        r"\bno tengo certeza\b", r"\bi'?m uncertain\b",
-        r"\bthis is speculative\b", r"\besto es especulativ\b",
+
+def _detect_uncertainty(full_text: str) -> bool:
+    """Detect uncertainty-recognition patterns in assistant text."""
+    patterns = [
+        r"\bi'?m not sure\b",
+        r"\bno estoy segur[oa]\b",
+        r"\bi don'?t know\b",
+        r"\bno sé\b",
+        r"\bno se\b",
+        r"\bmight be wrong\b",
+        r"\bpodría estar equivocad\b",
+        r"\bhonestly[,.]? i\b",
+        r"\bla verdad es que no\b",
+        r"\bno tengo certeza\b",
+        r"\bi'?m uncertain\b",
+        r"\bthis is speculative\b",
+        r"\besto es especulativ\b",
     ]
-    for pat in uncertainty_patterns:
-        if re.search(pat, full_text):
-            patterns_found.append("incertidumbre")
-            break
+    return any(re.search(pat, full_text) for pat in patterns)
 
-    # Pattern 4: Emergence — assistant response much longer than human question
-    # + contains signal words
+
+def _detect_emergence(
+    human_msgs: list[str],
+    assistant_texts: list[str],
+) -> bool:
+    """Detect unsolicited emergence — long response with signal words."""
     signal_words = [
-        "insight", "pattern", "connection", "emerge", "tension",
-        "patrón", "conexión", "tensión", "emerge", "descubr",
-        "surprising", "unexpected", "interesante", "fascinating",
+        "insight",
+        "pattern",
+        "connection",
+        "emerge",
+        "tension",
+        "patrón",
+        "conexión",
+        "tensión",
+        "descubr",
+        "surprising",
+        "unexpected",
+        "interesante",
+        "fascinating",
     ]
-    human_msgs = [m["text"] for m in conv["messages"] if m["sender"] == "human"]
-    for i, (h, a) in enumerate(zip(human_msgs, assistant_texts)):
+    for h, a in zip(human_msgs, assistant_texts):
         h_words = len(h.split())
         a_words = len(a.split())
         if a_words > h_words * 3 and a_words > 100:
             a_lower = a.lower()
             if any(sw in a_lower for sw in signal_words):
-                patterns_found.append("emergencia_no_pedida")
-                break
+                return True
+    return False
+
+
+def filter_by_patterns(conv: dict) -> tuple[bool, list[str]]:
+    """Filter 3: cognitive patterns in assistant messages.
+
+    Returns (passes, list_of_patterns_found).
+    """
+    assistant_texts = [
+        m["text"] for m in conv["messages"] if m["sender"] == "assistant"
+    ]
+    full_text = "\n".join(assistant_texts).lower()
+    human_msgs = [m["text"] for m in conv["messages"] if m["sender"] == "human"]
+
+    patterns_found: list[str] = []
+    if _detect_unanswered_question(assistant_texts):
+        patterns_found.append("pregunta_sin_respuesta")
+    if _detect_direction_change(full_text):
+        patterns_found.append("cambio_de_direccion")
+    if _detect_uncertainty(full_text):
+        patterns_found.append("incertidumbre")
+    if _detect_emergence(human_msgs, assistant_texts):
+        patterns_found.append("emergencia_no_pedida")
 
     return len(patterns_found) > 0, patterns_found
 
@@ -210,7 +253,9 @@ def conversation_to_markdown(conv: dict) -> str:
     return "\n".join(lines)
 
 
-def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list[str]:
+def chunk_text(
+    text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP
+) -> list[str]:
     """Split text into overlapping chunks by sentences."""
     text = re.sub(r"\n{3,}", "\n\n", text)
     sentences = re.split(r"(?<=[.!?])\s+", text)
@@ -272,12 +317,16 @@ def ingest_conversation(
     uuid_short = conv["uuid"][:8]
 
     for chunk in chunks:
-        result = _api_post(api_base, "/api/ingest", {
-            "text": chunk,
-            "source": f"dream:claude_export:{uuid_short}",
-            "participant_id": "claude_y_0xblackk",
-            "domain": "chat_session",
-        })
+        result = _api_post(
+            api_base,
+            "/api/ingest",
+            {
+                "text": chunk,
+                "source": f"dream:claude_export:{uuid_short}",
+                "participant_id": os.environ.get("DREAM_PARTICIPANT_ID", "anonymous"),
+                "domain": "chat_session",
+            },
+        )
         if result is not None:
             cells_created += len(result)
 
@@ -287,145 +336,233 @@ def ingest_conversation(
 # ── Main ───────────────────────────────────────────────
 
 
-def main() -> None:
+def _parse_args() -> argparse.Namespace:
+    """Parse CLI arguments for dream import."""
     parser = argparse.ArgumentParser(
         description="Import Claude.ai export into Dream substrate"
     )
     parser.add_argument("export_path", type=str, help="Path to conversations.json")
-    parser.add_argument("--dry-run", action="store_true", help="Report only, don't write files")
-    parser.add_argument("--min-turns", type=int, default=10, help="Min assistant turns (default: 10)")
-    parser.add_argument("--min-distance", type=float, default=0.3, help="Min semantic distance (default: 0.3)")
-    parser.add_argument("--verbose", "-v", action="store_true", help="Show per-conversation details")
-    parser.add_argument("--api", type=str, default=DEFAULT_API, help="Mycelium API base URL")
-    args = parser.parse_args()
+    parser.add_argument(
+        "--dry-run", action="store_true", help="Report only, don't write files"
+    )
+    parser.add_argument(
+        "--min-turns", type=int, default=10, help="Min assistant turns (default: 10)"
+    )
+    parser.add_argument(
+        "--min-distance",
+        type=float,
+        default=0.3,
+        help="Min semantic distance (default: 0.3)",
+    )
+    parser.add_argument(
+        "--verbose", "-v", action="store_true", help="Show per-conversation details"
+    )
+    parser.add_argument(
+        "--api", type=str, default=DEFAULT_API, help="Mycelium API base URL"
+    )
+    return parser.parse_args()
 
-    export_path = Path(args.export_path)
-    if not export_path.exists():
-        print(f"Error: {export_path} not found")
-        sys.exit(1)
 
-    # Parse export
-    conversations = parse_export(export_path)
-    total = len(conversations)
+def _assistant_count(conv: dict) -> int:
+    """Count assistant messages in a conversation."""
+    return sum(1 for m in conv["messages"] if m["sender"] == "assistant")
 
-    print("\n" + "=" * 60)
-    print("DREAM — Claude.ai Export Import")
-    print("=" * 60)
-    print(f"  Source: {export_path.name} ({total} conversations)")
-    print(f"  Filters: turns>{args.min_turns}, distance>{args.min_distance}, patterns")
-    if args.dry_run:
-        print("  Mode: DRY RUN (no files written)")
-    print()
 
-    # Initialize embedder for semantic distance
-    print("  Loading embedder...")
-    from mycelium.embedding.embedder import SentenceTransformerEmbedder
-    embedder = SentenceTransformerEmbedder()
-    print()
-
-    # ── Filter ──
-
-    print("  Filtering...")
-
-    discarded_length = 0
-    discarded_distance = 0
-    discarded_patterns = 0
-    passed = []
-
+def _discover_conversations(
+    conversations: list[dict],
+    embedder: SentenceTransformerEmbedder,
+    min_turns: int,
+    min_distance: float,
+    verbose: bool,
+) -> tuple[list[dict], int, int, int]:
+    """Apply all filters. Returns (passed, d_length, d_distance, d_patterns)."""
+    d_len = d_dist = d_pat = 0
+    passed: list[dict] = []
     for conv in conversations:
         name = conv["name"][:60]
-        msg_count = len(conv["messages"])
 
-        # Filter 1: Length
-        if not filter_by_length(conv, args.min_turns):
-            discarded_length += 1
-            if args.verbose:
-                assistant_count = sum(1 for m in conv["messages"] if m["sender"] == "assistant")
-                print(f"    ✗ [{assistant_count} turns] {name}")
+        if not filter_by_length(conv, min_turns):
+            d_len += 1
+            if verbose:
+                logger.info("    x [%d turns] %s", _assistant_count(conv), name)
             continue
 
-        # Filter 2: Semantic distance
-        passes_distance, distance = filter_by_semantic_distance(
-            conv, embedder, args.min_distance,
-        )
-        if not passes_distance:
-            discarded_distance += 1
-            if args.verbose:
-                print(f"    ✗ [dist={distance}] {name}")
+        ok_dist, distance = filter_by_semantic_distance(conv, embedder, min_distance)
+        if not ok_dist:
+            d_dist += 1
+            if verbose:
+                logger.info("    x [dist=%s] %s", distance, name)
             continue
 
-        # Filter 3: Cognitive patterns
-        passes_patterns, patterns = filter_by_patterns(conv)
-        if not passes_patterns:
-            discarded_patterns += 1
-            if args.verbose:
-                print(f"    ✗ [no patterns] {name}")
+        ok_pat, patterns = filter_by_patterns(conv)
+        if not ok_pat:
+            d_pat += 1
+            if verbose:
+                logger.info("    x [no patterns] %s", name)
             continue
 
-        # Passed all filters
-        assistant_count = sum(1 for m in conv["messages"] if m["sender"] == "assistant")
-        passed.append({
+        turns = _assistant_count(conv)
+        entry = {
             "conv": conv,
             "distance": distance,
             "patterns": patterns,
-            "assistant_turns": assistant_count,
-        })
-        print(f"    ✓ [{assistant_count} turns, dist={distance}, {'+'.join(patterns)}] {name}")
+            "assistant_turns": turns,
+        }
+        passed.append(entry)
+        logger.info(
+            "    + [%d turns, dist=%s, %s] %s",
+            turns,
+            distance,
+            "+".join(patterns),
+            name,
+        )
 
-    print()
-    discarded_total = discarded_length + discarded_distance + discarded_patterns
-    print(f"    ✗ Discarded by length (<{args.min_turns} turns): {discarded_length}")
-    print(f"    ✗ Discarded by semantic distance (<{args.min_distance}): {discarded_distance}")
-    print(f"    ✗ Discarded by patterns (no cognitive signal): {discarded_patterns}")
-    print(f"    ✓ Passed all filters: {len(passed)}")
+    return passed, d_len, d_dist, d_pat
 
-    # ── Ingest ──
 
-    if passed and not args.dry_run:
-        print(f"\n  Ingesting via API ({args.api})...")
-        total_cells = 0
+def _ingest_conversations(
+    passed: list[dict],
+    api_base: str,
+) -> int:
+    """Ingest filtered conversations via API, return total cells created."""
+    logger.info("  Ingesting via API (%s)...", api_base)
+    total_cells = 0
 
-        for item in passed:
-            conv = item["conv"]
-            name = conv["name"][:50]
-            cells = ingest_conversation(conv, args.api)
-            total_cells += cells
-            print(f"    {name} → {cells} cells")
+    for item in passed:
+        conv = item["conv"]
+        name = conv["name"][:50]
+        cells = ingest_conversation(conv, api_base)
+        total_cells += cells
+        logger.info("    %s -> %d cells", name, cells)
 
-        # Trigger one dream cycle — the Dreamer daemon handles the rest
-        print("\n  Dreaming (1 cycle)...")
-        # Scale pairs to substrate size: ~10% of possible pairs, capped at 50k
-        health = _api_post(args.api, "/api/health", {}) if False else None
-        pairs = min(total_cells * 50, 50000) if total_cells > 0 else 5000
-        result = _api_post(args.api, "/api/consolidate", {"pairs_per_cycle": pairs})
-        disc = len(result) if result else 0
-        print(f"    {disc} discoveries ({pairs} pairs examined)")
-        print("    (Dreamer daemon will continue consolidating in background)")
+    logger.info("  Dreaming (1 cycle)...")
+    pairs = min(total_cells * 50, 50000) if total_cells > 0 else 5000
+    result = _api_post(api_base, "/api/consolidate", {"pairs_per_cycle": pairs})
+    disc = len(result) if result else 0
+    logger.info("    %d discoveries (%d pairs examined)", disc, pairs)
+    logger.info("    (Dreamer daemon will continue consolidating in background)")
+    return total_cells
 
-    elif args.dry_run and passed:
-        print(f"\n  Would ingest {len(passed)} conversations via API (dry-run)")
-        for item in passed:
-            conv = item["conv"]
-            md = conversation_to_markdown(conv)
-            chunks = chunk_text(md)
-            print(f"    {conv['name'][:50]} ({item['assistant_turns']} turns, {len(chunks)} chunks)")
 
-    # ── Summary ──
+def _log_filter_results(
+    d_len: int,
+    d_dist: int,
+    d_pat: int,
+    passed: int,
+    min_turns: int,
+    min_distance: float,
+) -> None:
+    """Log per-filter discard counts and total passed."""
+    logger.info("    x Discarded by length (<%d turns): %d", min_turns, d_len)
+    logger.info("    x Discarded by semantic distance (<%s): %d", min_distance, d_dist)
+    logger.info("    x Discarded by patterns (no cognitive signal): %d", d_pat)
+    logger.info("    + Passed all filters: %d", passed)
 
-    print("\n" + "=" * 60)
-    print("COMPLETE")
-    print("=" * 60)
-    print(f"  Total conversations: {total}")
-    print(f"  Filtered (pass): {len(passed)}")
-    print(f"  Discarded: {discarded_total}")
-    print(f"    - By length: {discarded_length}")
-    print(f"    - By semantic distance: {discarded_distance}")
-    print(f"    - By patterns: {discarded_patterns}")
-    if not args.dry_run:
-        print(f"  Cells created: {total_cells if passed else 0}")
+
+def _log_dry_run_details(passed: list[dict]) -> None:
+    """Log per-conversation details during a dry run."""
+    logger.info("  Would ingest %d conversations via API (dry-run)", len(passed))
+    for item in passed:
+        conv = item["conv"]
+        md = conversation_to_markdown(conv)
+        chunks = chunk_text(md)
+        logger.info(
+            "    %s (%d turns, %d chunks)",
+            conv["name"][:50],
+            item["assistant_turns"],
+            len(chunks),
+        )
+
+
+def _print_summary(
+    total: int,
+    passed: int,
+    d_len: int,
+    d_dist: int,
+    d_pat: int,
+    *,
+    dry_run: bool,
+    total_cells: int,
+) -> None:
+    """Print the final summary block."""
+    logger.info("=" * 60)
+    logger.info("COMPLETE")
+    logger.info("=" * 60)
+    logger.info("  Total conversations: %d", total)
+    logger.info("  Filtered (pass): %d", passed)
+    logger.info("  Discarded: %d", d_len + d_dist + d_pat)
+    logger.info("    - By length: %d", d_len)
+    logger.info("    - By semantic distance: %d", d_dist)
+    logger.info("    - By patterns: %d", d_pat)
+    if not dry_run:
+        logger.info("  Cells created: %d", total_cells)
     else:
-        print(f"  Conversations that would be ingested: {len(passed)}")
-    print()
+        logger.info("  Conversations that would be ingested: %d", passed)
+
+
+def _log_banner(
+    filename: str,
+    total: int,
+    min_turns: int,
+    min_distance: float,
+    dry_run: bool,
+) -> None:
+    """Log the import header banner."""
+    logger.info("=" * 60)
+    logger.info("DREAM — Claude.ai Export Import")
+    logger.info("=" * 60)
+    logger.info("  Source: %s (%d conversations)", filename, total)
+    logger.info("  Filters: turns>%d, distance>%s, patterns", min_turns, min_distance)
+    if dry_run:
+        logger.info("  Mode: DRY RUN (no files written)")
+
+
+def main() -> None:
+    args = _parse_args()
+
+    export_path = Path(args.export_path)
+    if not export_path.exists():
+        logger.error("Export file not found: %s", export_path)
+        sys.exit(1)
+
+    conversations = parse_export(export_path)
+    total = len(conversations)
+    _log_banner(
+        export_path.name, total, args.min_turns, args.min_distance, args.dry_run
+    )
+
+    logger.info("  Loading embedder...")
+    from mycelium.embedding.embedder import SentenceTransformerEmbedder
+
+    embedder = SentenceTransformerEmbedder()
+    logger.info("  Filtering...")
+
+    passed, d_len, d_dist, d_pat = _discover_conversations(
+        conversations,
+        embedder,
+        args.min_turns,
+        args.min_distance,
+        args.verbose,
+    )
+    _log_filter_results(
+        d_len, d_dist, d_pat, len(passed), args.min_turns, args.min_distance
+    )
+
+    total_cells = 0
+    if passed and not args.dry_run:
+        total_cells = _ingest_conversations(passed, args.api)
+    elif args.dry_run and passed:
+        _log_dry_run_details(passed)
+
+    _print_summary(
+        total,
+        len(passed),
+        d_len,
+        d_dist,
+        d_pat,
+        dry_run=args.dry_run,
+        total_cells=total_cells,
+    )
 
 
 if __name__ == "__main__":
