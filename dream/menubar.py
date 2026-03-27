@@ -274,9 +274,9 @@ class DreamMenubar:
 
         try:
             logger.info("Launching ghostty with opencode")
-            # Fire-and-forget — OS manages the child process lifecycle
+            # Launch ghostty directly (not via 'open') to avoid macOS permission prompts
             subprocess.Popen(
-                ["open", "-a", "Ghostty", script_path],
+                ["/Applications/Ghostty.app/Contents/MacOS/ghostty", "-e", script_path],
             )
             logger.info("Ghostty launched")
         except (OSError, FileNotFoundError) as e:
